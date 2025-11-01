@@ -465,24 +465,23 @@ class MoELayer(nn.Module):
 
             out_flat = x_flat.new_zeros(N, h)
 
-            # (기존) 선택확률 p_chosen 계산
-            with torch.no_grad():
-                p = F.softmax(self._make_finite(affinities), dim=1)       # [N, E]
-                p_chosen = p.gather(1, top1_idx.view(-1,1)).view(-1,1)    # [N,1]
-
-            # >>> 추가: Stage-2용 full-feature 게이트(sigmoid(s_full)) 계산 <<<
-            if is_stage2:
-                with torch.no_grad():  # 게이팅 신호 계산만, 학습은 메인 경로에서
-                    s_full = self._make_finite(x_flat @ self.expert_centroids.t())   # [N, E]
-                    gate_stage2 = torch.sigmoid(s_full.gather(1, top1_idx.view(-1,1)))  # [N,1]
+            # 공통 full-feature affinity와 sigmoid 게이트(두 스테이지 동일 정의)
+            s_full = self._make_finite(x_flat @ self.expert_centroids.t())        # [N, E]
+            s_top1 = s_full.gather(1, top1_idx.view(-1,1))                        # [N,1]
+            gate_sigmoid = torch.sigmoid(s_top1)                                  # [N,1]
 
             # balance loss (Stage-1에서만)
             if (not is_stage2) and self.training and self.stable_balance_alpha > 0:
-                # switch류 간단형: P_i * f_i * E
-                counts = torch.bincount(top1_idx, minlength=self.num_experts).float()  # [E]
-                f = counts / float(N) + 1e-6
-                P = p.sum(dim=0)                                           # [E]
-                balance_loss = (P * f * self.num_experts).sum() * self.stable_balance_alpha
+                # 논문식: 각 expert에 실제로 라우팅된 토큰들의 σ(s_full) 합을 이용
+                n = float(N) / self.num_experts
+                balance = x_flat.new_zeros(())
+                for eid in range(self.num_experts):
+                    idx = (top1_idx == eid).nonzero(as_tuple=True)[0]
+                    if idx.numel() == 0:
+                        continue
+                    sigma_sum = torch.sigmoid(s_full[idx, eid]).sum()
+                    balance = balance + ((idx.numel() - n) / n) * sigma_sum
+                balance_loss = self.stable_balance_alpha * balance
             else:
                 balance_loss = None
 
@@ -499,9 +498,7 @@ class MoELayer(nn.Module):
 
                 if keep.numel() > 0:
                     y = experts[eid](x_flat[keep]).to(out_flat.dtype)
-                    # >>> 변경: Stage-2면 sigmoid 게이트, 아니면 기존 p_chosen 사용 <<<
-                    gate = gate_stage2 if is_stage2 else p_chosen
-                    y = y * gate[keep]
+                    y = y * gate_sigmoid[keep]
                     out_flat[keep] = y
                 if drop.numel() > 0:
                     # 용량 초과분은 residual 통과
@@ -620,7 +617,7 @@ def convert_gpt2_to_moe(
     capacity_factor: float = 1.25,
     freq_dict=None,
     xmoe_threshold: float = 0.90,
-    xmoe_capacity_factor: float = 1.0,
+    xmoe_capacity_factor: float | None = None,
     xmoe_expert_mult: float = 0.25,
     stable_routing_dim: int = 50,
     stable_balance_alpha: float = 0.3,
@@ -642,6 +639,17 @@ def convert_gpt2_to_moe(
         ])
         shared_router = RecurrentRouter(d_model=config.n_embd, hidden_dim=config.n_embd)
         layer_experts = 1
+
+    # --- XMoE 전용: γ(capacity factor) 자동 스케일링 ---
+    if mode == "xmoe":
+        # 논문 취지: expert dimension이 작아질수록 γ를 키워 FLOPs를 정합
+        # D_base = 4*d_model, D_x = D_base * xmoe_expert_mult => D_base / D_x = 1 / xmoe_expert_mult
+        if xmoe_capacity_factor is None:
+            scale = 1.0 / max(1e-6, float(xmoe_expert_mult))
+            xmoe_capacity_factor = float(capacity_factor) * scale
+        # (선택) 현실적 가드레일: 너무 극단적인 γ 방지
+        xmoe_capacity_factor = float(max(0.5, min(xmoe_capacity_factor, 8.0)))
+        print(f"🧮 XMoE γ auto-scale: base_cf={capacity_factor:.2f}, mult={xmoe_expert_mult:.2f} ⇒ γ={xmoe_capacity_factor:.2f}")
 
     for block in model.transformer.h:
         if mode == "ours_com":

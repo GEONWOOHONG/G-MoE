@@ -51,3 +51,9 @@ if __name__ == "__main__":
     main()
 
 #python run.py train --mode stablemoe --num_experts 16 --batch_size 44
+
+#cd "/c/IMML Lab/runpod_a100/repo"
+#git status
+#git add .
+#git commit -m "context"
+#git push origin main
