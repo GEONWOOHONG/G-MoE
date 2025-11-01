@@ -9,6 +9,21 @@ from torch.distributions.normal import Normal
 
 softplus = nn.Softplus()
 
+# ===== HyperMoE Shared Container =====
+class HyperMoEShared(nn.Module):
+    """Cross-layer shared hypernetwork bundle for HyperMoE."""
+    def __init__(self, cfg, d_model, n_experts):
+        super().__init__()
+        # selection embedding -> process -> hypernet parameter generator -> adapter
+        self.n_experts_embedding = nn.Embedding(n_experts, cfg["experts_embedding_dim"])
+        self.embedding_process = nn.Sequential(
+            nn.Linear(cfg["experts_embedding_dim"], cfg["process_dim"]),
+            nn.ReLU(),
+            nn.Linear(cfg["process_dim"], cfg["hypernet_input"]),
+        )
+        self.param_gen = ParameterGenerator(cfg, d_model, d_model)  # uses layer_embed inside
+        self.adapter_layer = AdapterLayer(d_model, d_model, cfg["adapter_dim"])
+
 # ===== Expert =====
 class Expert(nn.Module):
     def __init__(self, d_model, d_ff, initializer_range=0.02, use_gelu=False):
@@ -399,9 +414,8 @@ class MoELayer(nn.Module):
         elif global_experts is None:
             self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(num_experts)])
 
-    def _init_hypermoe(self, cfg, h):
-        """HyperMoE 파라미터를 미리 등록하는 초기화 함수"""
-        # core
+    def _init_hypermoe(self, cfg, h, shared: Optional[nn.Module]=None):
+        """HyperMoE 파라미터 초기화 (+선택적으로 cross-layer shared 모듈 주입)"""
         self.n_experts = self.num_experts
         self.k = int(cfg.get("k", 1))
         self.noisy_gating = bool(cfg.get("noisy_gating", True))
@@ -411,17 +425,28 @@ class MoELayer(nn.Module):
         # gates
         self.w_gate  = nn.Parameter(torch.zeros(h, self.n_experts))
         self.w_noise = nn.Parameter(torch.zeros(h, self.n_experts))
-        # 초기화 개선 (수렴 속도 향상)
         nn.init.normal_(self.w_gate,  mean=0.0, std=0.02)
         nn.init.normal_(self.w_noise, mean=0.0, std=0.02)
         self.mean = nn.Parameter(torch.tensor([0.0]), requires_grad=False)
         self.std  = nn.Parameter(torch.tensor([1.0]), requires_grad=False)
 
-        # experts
+        # per-layer experts (각 레이어 고유)
         self.experts_hypermoe = nn.ModuleList([Expert(h, h*4, use_gelu=True) for _ in range(self.n_experts)])
 
-        # optional hypernet adapters
-        if cfg.get("use_hypernet", True):
+        # ====== 공유/비공유 모듈 주입 ======
+        use_hn = cfg.get("use_hypernet", True)
+        if not use_hn:
+            self.adapter_layer = None
+            return
+
+        if shared is not None:
+            # ★ 공유 객체 바인딩 (모든 레이어가 동일 객체 참조)
+            self.adapter_layer        = shared.adapter_layer
+            self.n_experts_embedding  = shared.n_experts_embedding
+            self.embedding_process    = shared.embedding_process
+            self.param_gen            = shared.param_gen
+        else:
+            # (구버전과 동일: 레이어마다 따로 생성) ← 이제는 쓰지 않을 경로
             self.adapter_layer = AdapterLayer(self.input_size, self.output_size, cfg["adapter_dim"])
             self.n_experts_embedding = nn.Embedding(self.n_experts, cfg["experts_embedding_dim"])
             self.embedding_process = nn.Sequential(
@@ -430,8 +455,6 @@ class MoELayer(nn.Module):
                 nn.Linear(cfg["process_dim"], cfg["hypernet_input"]),
             )
             self.param_gen = ParameterGenerator(cfg, self.input_size, self.output_size)
-        else:
-            self.adapter_layer = None
 
     @staticmethod
     def _make_finite(x: torch.Tensor) -> torch.Tensor:
@@ -830,7 +853,8 @@ class GPT2LayerMoE(nn.Module):
             # MoELayer 인스턴스에 저장
             setattr(self.moe, "_hypermoe_cfg", cfg)
             # ★ 미리 모듈/파라미터 등록 (optimizer가 잡을 수 있도록)
-            self.moe._init_hypermoe(cfg, config.n_embd)
+            shared_pack = (hypermoe_kwargs or {}).get("_shared_pack", None)
+            self.moe._init_hypermoe(cfg, config.n_embd, shared=shared_pack)
 
         self.last_balance_loss = None
     def forward(self, hidden_states, input_ids=None, routing_state=None, global_step=None, **kwargs):
@@ -938,6 +962,30 @@ def convert_gpt2_to_moe(
         xmoe_capacity_factor = float(max(0.5, min(xmoe_capacity_factor, 8.0)))
         print(f"🧮 XMoE γ auto-scale: base_cf={capacity_factor:.2f}, mult={xmoe_expert_mult:.2f} ⇒ γ={xmoe_capacity_factor:.2f}")
 
+    # for-loop 바깥, hypermoe용 공유 팩 생성
+    hypermoe_shared_pack = None
+    if mode == "hypermoe":
+        # defaults는 아래에서 레이어별로 쓰는 hypermoe_defaults와 동일 스펙 유지
+        d_model = config.n_embd
+        defaults = dict(
+            k=1,
+            noisy_gating=True,
+            use_hypernet=True,
+            adapter_dim=max(16, d_model // 32),
+            hypernet_input=d_model,
+            hypernetwork_bottleneck=max(64, d_model // 8),
+            layer_emb_dim=8,
+            experts_embedding_dim=32,
+            process_dim=max(64, d_model // 8),
+            num_hidden_layers=getattr(config, "n_layer", getattr(config, "num_hidden_layers", 12)),
+            loss_coef=1e-2,
+            layer_idx=0,  # 더미, 실제 사용은 forward 인자
+        )
+        # ★ 모델 최상단에 등록(optimizer가 한 번만 파라미터 잡도록)
+        hypermoe_shared_pack = HyperMoEShared(defaults, d_model, num_experts)
+        # 모델 루트에 붙여서 weight 등록 (이름은 취향껏)
+        model.hypermoe_shared = hypermoe_shared_pack
+
     for i, block in enumerate(model.transformer.h):
         if mode == "ours_com":
             block.mlp = GPT2LayerMoE(
@@ -963,7 +1011,9 @@ def convert_gpt2_to_moe(
                 process_dim=max(64, config.n_embd // 8),
                 num_hidden_layers=getattr(config, "n_layer", getattr(config, "num_hidden_layers", 12)),
                 loss_coef=1e-2,
-                layer_idx=i,   # ★ 각 레이어 인덱스 주입
+                layer_idx=i,
+                # ★ 공유팩을 kwargs로 넘겨 GPT2LayerMoE가 _init_hypermoe(..., shared=...) 호출할 수 있게
+                _shared_pack=hypermoe_shared_pack,
             )
             layer = GPT2LayerMoE(
                 config, mode, num_experts,
