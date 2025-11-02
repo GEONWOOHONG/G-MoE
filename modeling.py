@@ -471,12 +471,14 @@ class MoELayer(nn.Module):
     def _maybe_freeze_stage2(self):
         if self.mode != "stablemoe" or self._stage2_frozen:
             return
-        for p in self.routing_emb.parameters():
-            p.requires_grad_(False)
-        self.distill_expert_centroids.requires_grad_(False)
+        # 루트 모델 파라미터를 얼린다
+        root = self._stable_root_ref() if hasattr(self, "_stable_root_ref") else None
+        assert root is not None, "StableMoE root ref missing"
+        root.stablemoe_routing_weight.requires_grad_(False)
+        root.stablemoe_distill_E.requires_grad_(False)
         self._stage2_frozen = True
         if self.training:
-            print("🔒 StableMoE: Froze routing_emb & distill_E for Stage-2")
+            print("🔒 StableMoE: Froze stablemoe_routing_weight & stablemoe_distill_E for Stage-2")
 
     def forward(self, x, input_ids=None, routing_state=None, global_step: Optional[int]=None):
         bsz, seq, h = x.shape
