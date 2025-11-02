@@ -38,9 +38,11 @@ def init_distributed():
 
 @torch.no_grad()
 def evaluate(model, dataloader, device):
+    is_main = (not dist.is_available()) or (not dist.is_initialized()) or (dist.get_rank() == 0)
     model.eval()
     losses = []
-    for batch in tqdm(dataloader, desc="Validating", leave=False):
+    it = tqdm(dataloader, desc="Validating", leave=False) if is_main else dataloader
+    for batch in it:
         input_ids = batch["input_ids"].to(device)
         labels = input_ids.clone()
         labels[labels == enc.eot_token] = -100
@@ -274,80 +276,90 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     point_one_step = max(1, total_train_steps // 1000)
     five_percent_interval = max(1, total_train_steps // 20)
 
-    if is_dist and train_sampler is not None:
-        train_sampler.set_epoch(0)  # 단일 epoch 구조
-    for step, batch in enumerate(train_loader, start=start_step + 1):
-        input_ids = batch["input_ids"].to(device)
-        labels = input_ids.clone()
-        labels[labels == enc.eot_token] = -100
+    num_epochs = 1
+    for epoch in range(num_epochs):
+        if is_dist and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
 
-        # 마이크로스텝 통신 억제
-        sync_now = (step % grad_accum) == 0
-        ddp_ctx = torch.no_grad if not is_dist else (model.no_sync if not sync_now else (lambda: contextlib.nullcontext))
-        with (ddp_ctx() if is_dist and hasattr(model, "no_sync") and not sync_now else contextlib.nullcontext()):
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=batch["attention_mask"].to(device),
-                    labels=labels,
-                    global_step=step,
-                )
-                main_loss = outputs.loss
+        for step, batch in enumerate(train_loader, start=start_step + 1):
+            input_ids = batch["input_ids"].to(device)
+            labels = input_ids.clone()
+            labels[labels == enc.eot_token] = -100
 
-            balance_losses = [m.last_balance_loss for m in model.modules() if isinstance(m, GPT2LayerMoE) and m.last_balance_loss is not None]
-            aux_loss = torch.stack(balance_losses).mean() if balance_losses else 0.0
-            loss = main_loss + aux_loss
+            # ⬇️ no_sync 문맥
+            sync_now = (step % grad_accum) == 0
+            ctx = (model.no_sync() if (is_dist and not sync_now) else contextlib.nullcontext())
+            with ctx:
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=batch["attention_mask"].to(device),
+                        labels=labels,
+                        global_step=step,
+                    )
+                    main_loss = outputs.loss
 
-            # stablemoe 보조 로스 분해 로깅
-            if mode == "stablemoe":
-                balances, distills, overflows = [], [], []
-                for m in model.modules():
-                    if isinstance(m, GPT2LayerMoE) and hasattr(m, "moe") and isinstance(getattr(m, "moe", None), type(model.transformer.h[0].mlp.moe)):
-                        aux = m.moe.last_aux
-                        if aux:
-                            if aux["balance"] is not None: balances.append(float(aux["balance"]))
-                            if aux["distill"]  is not None: distills.append(float(aux["distill"]))
-                            if aux["overflow_rate"] is not None: overflows.append(float(aux["overflow_rate"]))
-                if balances and writer: writer.add_scalar("stablemoe/balance_loss", sum(balances)/len(balances), step)
-                if distills and writer: writer.add_scalar("stablemoe/distill_loss",  sum(distills)/len(distills), step)
-                if overflows and writer: writer.add_scalar("stablemoe/overflow_rate", sum(overflows)/len(overflows), step)
+                balance_losses = [m.last_balance_loss for m in model.modules()
+                                if isinstance(m, GPT2LayerMoE) and m.last_balance_loss is not None]
+                aux_loss = torch.stack(balance_losses).mean() if balance_losses else 0.0
+                loss = main_loss + aux_loss
 
-            # === Gradient Accumulation ===
-            (loss / grad_accum).backward()
+                # StableMoE 분해 로깅 (생략 가능)
+                if mode == "stablemoe":
+                    balances, distills, overflows = [], [], []
+                    for m in model.modules():
+                        if isinstance(m, GPT2LayerMoE) and hasattr(m, "moe"):
+                            aux = m.moe.last_aux
+                            if aux:
+                                if aux["balance"] is not None: balances.append(float(aux["balance"]))
+                                if aux["distill"]  is not None: distills.append(float(aux["distill"]))
+                                if aux["overflow_rate"] is not None: overflows.append(float(aux["overflow_rate"]))
+                    if balances and writer: writer.add_scalar("stablemoe/balance_loss", sum(balances)/len(balances), step)
+                    if distills and writer: writer.add_scalar("stablemoe/distill_loss",  sum(distills)/len(distills), step)
+                    if overflows and writer: writer.add_scalar("stablemoe/overflow_rate", sum(overflows)/len(overflows), step)
 
-        # <-- 여기서만 클립/스텝
-        if sync_now:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+                (loss / grad_accum).backward()
 
-        if progress_bar:
-            progress_bar.update(1)
-            progress_bar.set_postfix(loss=loss.item(), main=main_loss.item(),
-                                     aux=aux_loss.item() if isinstance(aux_loss, torch.Tensor) else 0.0)
-        if writer:
-            writer.add_scalar("train/loss", loss.item(), step)
+            # ⬇️ 이 블록들 모두 inner for 안에 있어야 함
+            if sync_now:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
-        if step % five_percent_interval == 0 or step == point_one_step:
-            msg = (f"🔍 Full validation (every 5%) at step {step}..."
-                   if step % five_percent_interval == 0 else f"🔍 Quick validation (0.1%) at step {step}...")
             if progress_bar:
-                progress_bar.write(msg)
-            # 평가/통계는 DDP 래핑 모델이 아니라 base_model(원본 모듈) 참조 X → forward는 model 사용
-            valid_loss, valid_ppl = evaluate(model, valid_loader, device)
-            stats = compute_moe_stats(base_model, config, mode) if (step % five_percent_interval == 0) else {"balance": 0.0}
-            if is_main():
-                if step % five_percent_interval == 0:
-                    print(f"[Step {step}] Valid Loss {valid_loss:.4f}, PPL {valid_ppl:.2f}, Balance {stats['balance']:.4f}")
+                progress_bar.update(1)
+                progress_bar.set_postfix(
+                    loss=loss.item(),
+                    main=main_loss.item(),
+                    aux=aux_loss.item() if isinstance(aux_loss, torch.Tensor) else 0.0
+                )
+            if writer:
+                writer.add_scalar("train/loss", loss.item(), step)
+                if step % 50 == 0:
+                    writer.add_scalar("train/lr", scheduler.get_last_lr()[0], step)
+
+            if step % five_percent_interval == 0 or step == point_one_step:
+                msg = (f"🔍 Full validation (every 5%) at step {step}..."
+                    if step % five_percent_interval == 0
+                    else f"🔍 Quick validation (0.1%) at step {step}...")
+                if progress_bar:
+                    progress_bar.write(msg)
+
+                valid_loss, valid_ppl = evaluate(model, valid_loader, device)
+                stats = compute_moe_stats(base_model, config, mode) if (step % five_percent_interval == 0) else {"balance": 0.0}
+
+                if is_main():
+                    if step % five_percent_interval == 0:
+                        print(f"[Step {step}] Valid Loss {valid_loss:.4f}, PPL {valid_ppl:.2f}, Balance {stats['balance']:.4f}")
+                        if writer:
+                            writer.add_scalar("valid/balance", stats["balance"], step)
                     if writer:
-                        writer.add_scalar("valid/balance", stats["balance"], step)
-                if writer:
-                    writer.add_scalar("valid/loss", valid_loss, step)
-                    writer.add_scalar("valid/ppl", valid_ppl, step)
-                if valid_loss < best_loss:
-                    best_loss = valid_loss
-                    save_checkpoint(base_model, optimizer, scheduler, step, best_loss, total_train_steps, save_dir, "best_checkpoint.safetensors")
+                        writer.add_scalar("valid/loss", valid_loss, step)
+                        writer.add_scalar("valid/ppl", valid_ppl, step)
+                    if valid_loss < best_loss:
+                        best_loss = valid_loss
+                        save_checkpoint(base_model, optimizer, scheduler, step, best_loss, total_train_steps, save_dir, "best_checkpoint.safetensors")
 
         if writer and step % 50 == 0:
             writer.add_scalar("train/lr", scheduler.get_last_lr()[0], step)

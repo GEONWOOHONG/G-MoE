@@ -1,5 +1,8 @@
 # run.py — CLI 엔트리포인트
 import os, subprocess, shutil, contextlib
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+os.environ.setdefault("HF_HUB_ENABLE_PROGRESS_BARS", "0")
+os.environ.setdefault("HF_DATASETS_VERBOSITY", "warning")
 
 def _setenv_if_missing(k, v):
     if os.environ.get(k) in (None, ""):
@@ -40,8 +43,14 @@ def _detect_nvlink():
     return has_nv, topo
 
 def setup_nccl_env_safely(print_topology_rank0=True):
-    # 항상 안전한 기본값 (있으면 유지, 없으면 채움)
-    _setenv_if_missing("NCCL_ASYNC_ERROR_HANDLING", "1")
+    # PyTorch 권장값으로 교체 (NCCL_ASYNC_ERROR_HANDLING은 deprecated)
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    # 기존 deprecated 환경변수는 제거
+    os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
+    
+    # OMP 경고 제거 (프로세스당 쓰레드 1 고정; torchrun가 기본 1로 고치지만 명시 권장)
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    
     _setenv_if_missing("NCCL_DEBUG", "WARN")
 
     # 토폴로지 감지
@@ -165,7 +174,7 @@ if __name__ == "__main__":
 
 #apt-get update && apt-get install -y zip unzip
 #apt update && apt install -y nano
-#pip install transformers datasets tensorboard pandas tqdm scipy tiktoken safetensors huggingface_hub
+#pip install transformers datasets tensorboard pandas tqdm scipy tiktoken safetensors huggingface_hub hf_transfer
 
 #wget https://github.com/schollz/croc/releases/download/v10.2.5/croc_v10.2.5_Linux-64bit.tar.gz
 #tar xzf croc_v10.2.5_Linux-64bit.tar.gz

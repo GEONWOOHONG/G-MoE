@@ -11,6 +11,7 @@ def worker_init_fn(worker_id):
     
     # 각 워커마다 고유한 시드 설정
     worker_seed = 42 + worker_id + rank
+    torch.manual_seed(worker_seed)
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
