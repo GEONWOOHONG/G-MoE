@@ -1,4 +1,3 @@
-# train.py — 학습/평가/통계 (원본 로직 그대로)
 import os, math, torch, tiktoken, shutil, contextlib
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -21,24 +20,17 @@ from utils import (set_seed, get_default_optimizer, get_default_scheduler,
 
 from torch.utils.tensorboard import SummaryWriter
 
-ensure_flash_attn()  # 원본과 동일하게 모듈 레벨에서 즉시 호출
+ensure_flash_attn()
 
 enc = tiktoken.get_encoding("gpt2")
 
 def chunked_cross_entropy(logits, labels, ignore_index=-100, chunk_tokens=8192):
-    """
-    GPT-2 계열은 HF가 내부에서 CE 계산 시 shift를 합니다.
-    여기서도 동일하게 직접 shift 후, BT 축을 chunk로 나눠 CE를 계산해 피크 메모리 절감.
-    logits: [B, T, V], labels: [B, T]
-    """
-    # 1) GPT2-style shift (next-token prediction)
-    shift_logits = logits[:, :-1, :].contiguous()    # [B, T-1, V]
-    shift_labels = labels[:, 1:].contiguous()        # [B, T-1]
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
 
     B, Tm1, V = shift_logits.shape
     bt = B * Tm1
 
-    # 2) BT x V 로 펴서 chunk-by-chunk로 CE 계산
     flat_logits = shift_logits.view(bt, V)
     flat_labels = shift_labels.view(bt)
 
@@ -53,7 +45,6 @@ def chunked_cross_entropy(logits, labels, ignore_index=-100, chunk_tokens=8192):
             reduction="sum",
         )
         total += loss
-        # 유효 토큰 수 (ignore_index 제외)
         if ignore_index is not None:
             valid += (flat_labels[start:end] != ignore_index).sum().item()
         else:
@@ -211,7 +202,6 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset) if is_dist else None
     valid_sampler = torch.utils.data.distributed.DistributedSampler(valid_dataset, shuffle=False) if is_dist else None
     
-    # 워커 시드 고정을 위한 Generator 생성
     train_generator = get_dataloader_generator(rank if is_dist else 0)
     valid_generator = get_dataloader_generator(rank if is_dist else 0)
     
@@ -263,20 +253,18 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
 
     if continue_training and trainer_state is not None:
         optimizer.load_state_dict(trainer_state["optimizer"])
-        # 총 옵티 스텝 수를 복원(없으면 현재 에폭의 추정치 사용)
         total_steps = trainer_state.get("total_train_steps", optim_steps_per_epoch)
         scheduler = get_default_scheduler(optimizer, total_steps, warmup_ratio=0.1)
         if "scheduler" in trainer_state:
             scheduler.load_state_dict(trainer_state["scheduler"])
         best_loss   = trainer_state["best_loss"]
-        start_step  = trainer_state["step"]  # 주의: 이건 'optim_step'으로 해석할 예정
+        start_step  = trainer_state["step"]
         try:
             print("🔎 Resume LR:", scheduler.get_last_lr()[0])
         except Exception:
             print("🔎 Resume LR (param_group[0]):", optimizer.param_groups[0]["lr"])
         print(f"🔹 Resumed training from step {start_step}, best_loss={best_loss:.4f}")
     else:
-        # 한 에폭만 학습하므로 해당 에폭 내 옵티 스텝 수
         total_steps = optim_steps_per_epoch
         scheduler   = get_default_scheduler(optimizer, total_steps, warmup_ratio=0.1)
         best_loss   = float("inf")
@@ -294,13 +282,10 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
             print(f"🧭 StableMoE schedule: Stage-1 = {stage1_steps} steps "
                   f"({stage1_ratio*100:.1f}% of {total_steps}), Stage-2 thereafter.")
         
-        # Stage-2 진입 시 명시적 고정 보장 (안전 가드)
         print("🔒 StableMoE: Pre-freezing routing components for Stage-2 safety...")
         for m in model.modules():
             if isinstance(m, GPT2LayerMoE) and m.mode == "stablemoe":
-                # Stage-1 종료 직후 즉시 freeze 준비 (forward에서도 안전가드 동작)
-                # 논문: Stage-2에서 D(·)와 Ě를 동결
-                pass  # forward에서 _maybe_freeze_stage2()가 처리하지만, 명시적 준비
+                pass
         
         if writer:
             writer.add_scalar("stablemoe/stage1_steps", stage1_steps, 0)
@@ -317,7 +302,6 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     point_one_step = max(1, total_train_steps // 1000)
     five_percent_interval = max(1, total_train_steps // 20)
 
-    # 🔹 중단지점 재개 시 중복 학습 방지
     remaining_optim_steps = total_steps - start_step
     if remaining_optim_steps <= 0 and is_main():
         print("✅ Already completed planned steps; skipping training.")
@@ -325,7 +309,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
 
     num_epochs = 1
     optim_step = start_step
-    reached_budget = False  # 2중 루프 탈출용 플래그
+    reached_budget = False
     
     for epoch in range(num_epochs):
         if is_dist and train_sampler is not None:
@@ -336,7 +320,6 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
             labels = input_ids.clone()
             labels[labels == enc.eot_token] = -100
 
-            # ⬇️ no_sync 문맥
             sync_now = (step % grad_accum) == 0
             ctx = (model.no_sync() if (is_dist and not sync_now) else contextlib.nullcontext())
             with ctx:
@@ -359,7 +342,6 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
                     aux_loss = torch.zeros((), device=main_loss.device, dtype=main_loss.dtype)
                 loss = main_loss + aux_loss
 
-                # StableMoE 분해 로깅 (생략 가능)
                 if mode == "stablemoe":
                     balances, distills, overflows = [], [], []
                     for m in model.modules():
@@ -380,18 +362,15 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
-                optim_step += 1  # ✅ 옵티 스텝 증가
+                optim_step += 1
                 
-                # 🔹 총 스텝 도달 시 탈출
                 if optim_step >= total_steps:
                     reached_budget = True
                     break
 
-                # 🔹 LR 로깅은 옵티 스텝 기준
                 if writer and (optim_step % 50 == 0):
                     writer.add_scalar("train/lr", scheduler.get_last_lr()[0], optim_step)
 
-                # 🔹 검증도 옵티 스텝 기준
                 if (optim_step % five_percent_interval == 0) or (optim_step == point_one_step):
                     msg = ("🔍 Full validation (every 5%) at optim step "
                         f"{optim_step}..." if (optim_step % five_percent_interval == 0)
@@ -421,7 +400,6 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
                     aux=aux_loss.item() if isinstance(aux_loss, torch.Tensor) else 0.0
                 )
         
-        # 🔹 2중 루프 탈출 처리
         if reached_budget:
             if is_main():
                 print(f"✅ Reached training budget at step {optim_step}/{total_steps}")
@@ -432,7 +410,6 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     if is_main():
         save_checkpoint(base_model, optimizer, scheduler, optim_step, best_loss, total_train_steps, save_dir, "last_checkpoint.safetensors")
     
-    # 🔹 종료 시 프로세스 정리
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()

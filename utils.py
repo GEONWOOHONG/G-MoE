@@ -1,9 +1,7 @@
-# utils.py — 공용 유틸(시드/옵티마이저/스케줄러/체크포인트/런타임 캐시)
 import os, math, random, numpy as np, torch
 from safetensors.torch import save_model
 from transformers import get_cosine_schedule_with_warmup
 
-# 전역 캐시 for input_ids (hash 게이팅 지원) — 원본 인터페이스 유지
 CURRENT_INPUT_IDS = None
 def set_current_input_ids(x):
     global CURRENT_INPUT_IDS
@@ -35,7 +33,6 @@ def get_default_scheduler(optimizer, total_steps, warmup_ratio=0.1):
     return scheduler
 
 def save_checkpoint(model, optimizer, scheduler, step, best_loss, total_train_steps, path, name="checkpoint.safetensors"):
-    # DDP 래핑 대응: 실제 모듈로 저장
     if hasattr(model, "module"):
         model = model.module
     model_path = os.path.join(path, f"{name}")

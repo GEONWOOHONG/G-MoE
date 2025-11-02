@@ -1,4 +1,3 @@
-# modeling.py — Expert/Router/MoE/GPT2LayerMoE/HashRouter/convert 함수
 import math, random, torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,22 +8,19 @@ from torch.distributions.normal import Normal
 
 softplus = nn.Softplus()
 
-# ===== HyperMoE Shared Container =====
 class HyperMoEShared(nn.Module):
     """Cross-layer shared hypernetwork bundle for HyperMoE."""
     def __init__(self, cfg, d_model, n_experts):
         super().__init__()
-        # selection embedding -> process -> hypernet parameter generator -> adapter
         self.n_experts_embedding = nn.Embedding(n_experts, cfg["experts_embedding_dim"])
         self.embedding_process = nn.Sequential(
             nn.Linear(cfg["experts_embedding_dim"], cfg["process_dim"]),
             nn.ReLU(),
             nn.Linear(cfg["process_dim"], cfg["hypernet_input"]),
         )
-        self.param_gen = ParameterGenerator(cfg, d_model, d_model)  # uses layer_embed inside
+        self.param_gen = ParameterGenerator(cfg, d_model, d_model)
         self.adapter_layer = AdapterLayer(d_model, d_model, cfg["adapter_dim"])
 
-# ===== Expert =====
 class Expert(nn.Module):
     def __init__(self, d_model, d_ff, initializer_range=0.02, use_gelu=False):
         super().__init__()
@@ -38,7 +34,6 @@ class Expert(nn.Module):
         nn.init.normal_(self.w1.weight, mean=0.0, std=initializer_range)
         nn.init.normal_(self.w2.weight, mean=0.0, std=initializer_range)
 
-# ==== HyperMoE helpers ====
 def hyperfanin_init_weight(linear_layer, hypernet_in, mainnet_in):
     bound = 1e-3 * math.sqrt(3 / (hypernet_in * mainnet_in))
     nn.init.uniform_(linear_layer.weight, -bound, bound)
@@ -78,7 +73,6 @@ class ParameterGenerator(nn.Module):
         self.decoder = SimpleGenerator(cfg, input_size, output_size)
 
     def forward(self, hidden_inputs, layer_idx):
-        # hidden_inputs: [B, L, hypernet_input]
         layer_idx = torch.ones(hidden_inputs.size(0), hidden_inputs.size(1),
                                dtype=torch.long, device=hidden_inputs.device) * layer_idx
         layer_inputs = self.layer_embed(layer_idx)
@@ -91,12 +85,10 @@ class AdapterLayer(nn.Module):
         self.adapter_dim = adapter_dim
         self.input_dim = input_size
         self.output_dim = output_size
-        # generated path (set at runtime)
         self.adapter_down_weight = None
         self.adapter_down_bias = None
         self.adapter_up_weight = None
         self.adapter_up_bias = None
-        # fallback manual adapters (used when clear)
         self.hidden_act = nn.ReLU()
         self.adapter_down_manual = nn.Linear(self.input_dim, self.adapter_dim)
         self.adapter_up_manual = nn.Linear(self.adapter_dim, self.output_dim)
@@ -119,7 +111,6 @@ class AdapterLayer(nn.Module):
 
     def forward(self, x):
         if self.adapter_down_weight is not None:
-            # ✅ 가중치 dtype으로 x를 맞춰 안전하게 연산
             wd = self.adapter_down_weight
             bu = self.adapter_up_bias
             wu = self.adapter_up_weight
@@ -150,17 +141,15 @@ class SparseDispatcher:
         return torch.split(inp_exp, self._part_sizes, dim=0)
 
     def combine(self, expert_out, multiply_by_gates=True):
-        stitched = torch.cat(expert_out, 0)  # [S, H] 또는 [S, ...]
+        stitched = torch.cat(expert_out, 0)
         if multiply_by_gates:
-            # self._nonzero_gates: [S, 1] 이어야 함. 안전하게 reshape + dtype/device 정렬
             g = self._nonzero_gates
             if g.dim() == 1:
-                g = g.unsqueeze(-1)              # [S] -> [S,1]
-            # 고정: 항상 마지막 축들에 1을 추가해 [S,1,...] 로 맞춰 브로드캐스팅 폭주 방지
+                g = g.unsqueeze(-1)
             while g.dim() < stitched.dim():
                 g = g.unsqueeze(-1)
             g = g.to(device=stitched.device, dtype=stitched.dtype)
-            stitched = stitched * g             # 안전한 브로드캐스팅
+            stitched = stitched * g
 
         if stitched.dim() == 2:
             zeros = torch.zeros(self._gates.size(0), stitched.size(1),
@@ -195,7 +184,7 @@ def _prob_in_top_k(layer, clean_values, noisy_values, noise_stddev, noisy_top_va
     return torch.where(is_in, prob_if_in, prob_if_out)
 
 def noisy_top_k_gating_mixing(layer, x, train, noise_epsilon=1e-2):
-    clean_logits = x @ layer.w_gate  # [N, E]
+    clean_logits = x @ layer.w_gate
     if layer.noisy_gating and train:
         raw_noise_stddev = x @ layer.w_noise
         noise_stddev = softplus(raw_noise_stddev) + noise_epsilon
@@ -203,7 +192,7 @@ def noisy_top_k_gating_mixing(layer, x, train, noise_epsilon=1e-2):
         logits = noisy_logits
     else:
         logits = clean_logits
-    logits = torch.softmax(logits, dim=-1)                 # (1) softmax
+    logits = torch.softmax(logits, dim=-1)
     top_logits, top_indices = logits.topk(min(layer.k+1, layer.n_experts), dim=-1)
     top_k_logits = top_logits[:, :layer.k]
     top_k_indices = top_indices[:, :layer.k]
@@ -226,7 +215,6 @@ def noisy_top_k_gating_mixing(layer, x, train, noise_epsilon=1e-2):
         load = _gates_to_load(gates)
     return gates, load, gates_unselected, expert_mask
 
-# ===== Schedulers/routers =====
 class RecurrentRouter(nn.Module):
     def __init__(self, d_model, hidden_dim=None):
         super().__init__()
@@ -325,7 +313,6 @@ class Router(nn.Module):
             aux_loss = (Pi * fi).sum() * self.alpha
         return topk_weight, topk_idx, aux_loss
 
-# ===== MoE Layer =====
 class MoELayer(nn.Module):
     def __init__(self, d_model, d_ff, num_experts,
                 mode="switch", shared_expert=None, global_experts=None,
@@ -396,14 +383,11 @@ class MoELayer(nn.Module):
             self.router = Router(d_model, num_experts, top_k=(1 if mode=="switch" else 2), alpha=alpha)
         
         elif mode == "stablemoe":
-            # === StableMoE (single-device, no all_to_all) ===
             self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(num_experts)])
             self.capacity_factor = capacity_factor
-            # 라우팅용 센트로이드 (Stage-1: d_model, Stage-2: routing_dim)
             self.expert_centroids = nn.Parameter(torch.empty(num_experts, d_model))
             nn.init.orthogonal_(self.expert_centroids, gain=0.1)
 
-            # 기본 설정값들 (convert_gpt2_to_moe에서 주입됨)
             self.stable_routing_dim = getattr(self, "stable_routing_dim", 50)
             self.vocab_size = getattr(self, "vocab_size", 50257)
             
@@ -446,14 +430,12 @@ class MoELayer(nn.Module):
         return alpha * loss
 
     def _init_hypermoe(self, cfg, h, shared: Optional[nn.Module]=None):
-        """HyperMoE 파라미터 초기화 (+선택적으로 cross-layer shared 모듈 주입)"""
         self.n_experts = self.num_experts
         self.k = int(cfg.get("k", 1))
         self.noisy_gating = bool(cfg.get("noisy_gating", True))
         self.input_size = h
         self.output_size = h
 
-        # gates
         self.w_gate  = nn.Parameter(torch.zeros(h, self.n_experts))
         self.w_noise = nn.Parameter(torch.zeros(h, self.n_experts))
         nn.init.normal_(self.w_gate,  mean=0.0, std=0.02)
@@ -461,17 +443,14 @@ class MoELayer(nn.Module):
         self.mean = nn.Parameter(torch.tensor([0.0]), requires_grad=False)
         self.std  = nn.Parameter(torch.tensor([1.0]), requires_grad=False)
 
-        # per-layer experts (각 레이어 고유)
         self.experts_hypermoe = nn.ModuleList([Expert(h, h*4, use_gelu=True) for _ in range(self.n_experts)])
 
-        # ====== 공유/비공유 모듈 주입 ======
         use_hn = cfg.get("use_hypernet", True)
         if not use_hn:
             self.adapter_layer = None
             return
 
         if shared is not None:
-            # ★ 공유 객체 바인딩 (모든 레이어가 동일 객체 참조)
             self.adapter_layer        = shared.adapter_layer
             self.n_experts_embedding  = shared.n_experts_embedding
             self.embedding_process    = shared.embedding_process
@@ -482,7 +461,6 @@ class MoELayer(nn.Module):
             for p in self.adapter_layer.adapter_up_manual.parameters():
                 p.requires_grad_(False)
         else:
-            # (구버전과 동일: 레이어마다 따로 생성) ← 이제는 쓰지 않을 경로
             self.adapter_layer = AdapterLayer(self.input_size, self.output_size, cfg["adapter_dim"])
             self.n_experts_embedding = nn.Embedding(self.n_experts, cfg["experts_embedding_dim"])
             self.embedding_process = nn.Sequential(
@@ -504,7 +482,6 @@ class MoELayer(nn.Module):
     def _maybe_freeze_stage2(self):
         if self.mode != "stablemoe" or self._stage2_frozen or (not self.training):
             return
-        # 루트 모델 파라미터를 얼린다
         root = self._stable_root_ref() if hasattr(self, "_stable_root_ref") else None
         assert root is not None, "StableMoE root ref missing"
         root.stablemoe_routing_weight.requires_grad_(False)
@@ -634,8 +611,7 @@ class MoELayer(nn.Module):
             routed_out = local_out + global_out
 
             alpha = getattr(self, "ddp_probe_alpha", 1e-8)
-            probe = self._ddp_probe_loss(dtype=x.dtype, device=x.device, alpha=alpha)  # local expert들
-            # global_experts도 1회씩 통과
+            probe = self._ddp_probe_loss(dtype=x.dtype, device=x.device, alpha=alpha)
             if hasattr(self, "global_experts") and self.global_experts is not None:
                 d = self.d_model
                 p = torch.randn(8, d, device=x.device, dtype=x.dtype) * 1e-3
@@ -654,7 +630,7 @@ class MoELayer(nn.Module):
         elif self.mode == "hash":
             if input_ids is None:
                 try:
-                    from utils import get_current_input_ids  # 수정: utils에서 import
+                    from utils import get_current_input_ids
                     input_ids = get_current_input_ids()
                 except Exception:
                     pass
@@ -725,18 +701,10 @@ class MoELayer(nn.Module):
             return routed_out, balance_loss, updated_routing_state
 
         elif self.mode == "stablemoe":
-            """
-            Stage-1: 대용량 표현(h) 기반 라우팅, distill CE + balance loss 사용
-            Stage-2: 경량 라우터(embedding) 기반 라우팅 고정, 보조 손실 없음
-            단일 GPU 버전: expert별 토큰 슬라이스 → 처리 → 원위치 scatter
-            """
-            # --- stage 판정 ---
-            # 안전 가드: 아직 train.py가 값을 주입하지 않으면 매우 큰 값으로 간주(즉, stage-1 유지)
             _stage1_steps = self.stable_stage1_steps if self.stable_stage1_steps is not None else (1 << 62)
             if global_step is not None:
                 is_stage2 = (global_step >= _stage1_steps)
             else:
-                # 학습 중이면 내부 카운터 업데이트(옵션)
                 if self.training:
                     self._num_updates_buf += 1
                 is_stage2 = (int(self._num_updates_buf.item()) >= _stage1_steps)
@@ -747,9 +715,7 @@ class MoELayer(nn.Module):
             N = bsz * seq
             x_flat = x.view(N, h)
 
-            # --- affinity 계산 ---
             if is_stage2:
-                # 경량 라우터 경로(동결 가정)로 라우팅
                 if input_ids is None:
                     try:
                         from utils import get_current_input_ids
@@ -758,7 +724,7 @@ class MoELayer(nn.Module):
                         pass
                 if input_ids is None:
                     raise ValueError("stablemoe mode requires input_ids for routing.")
-                with torch.no_grad():  # stage2 라우팅 전체를 진짜로 고정
+                with torch.no_grad():
                     root = self._stable_root_ref() if hasattr(self, "_stable_root_ref") else None
                     assert root is not None, "StableMoE root ref missing"
                     rfeat = F.embedding(input_ids.view(-1), root.stablemoe_routing_weight)
@@ -766,8 +732,7 @@ class MoELayer(nn.Module):
                     affinities = rfeat @ E.t()
                 distill_loss = None
             else:
-                # Stage-1: full feat로 라우팅 + (오직 레이어 0)에서만 distill CE
-                affinities = x_flat @ self.expert_centroids.t()           # [N, E]
+                affinities = x_flat @ self.expert_centroids.t()
                 affinities = self._make_finite(affinities)
                 if input_ids is None:
                     try:
@@ -779,56 +744,49 @@ class MoELayer(nn.Module):
                     raise ValueError("stablemoe mode requires input_ids during Stage-1.")
 
                 with torch.no_grad():
-                    target = affinities.argmax(dim=1)                    # [N]
+                    target = affinities.argmax(dim=1)
 
                 is_primary = (getattr(self, "_layer_idx", 0) == 0)
                 if is_primary:
                     root = self._stable_root_ref() if hasattr(self, "_stable_root_ref") else None
                     assert root is not None, "StableMoE root ref missing"
-                    rfeat = F.embedding(input_ids.view(-1), root.stablemoe_routing_weight)  # needs grad
-                    E = root.stablemoe_distill_E  # needs grad
+                    rfeat = F.embedding(input_ids.view(-1), root.stablemoe_routing_weight)
+                    E = root.stablemoe_distill_E
                     logits_d = rfeat @ E.t()
                     distill_loss = F.cross_entropy(logits_d, target, reduction="mean")
                 else:
-                    # 비-주 레이어는 distill/경량 라우터 경로를 전혀 만들지 않음 (E 접근 금지)
                     distill_loss = None
 
-            top1_idx = affinities.argmax(dim=1)                           # [N]
-            # capacity per expert
+            top1_idx = affinities.argmax(dim=1)
             cap = int(math.ceil(N / self.num_experts) * self.capacity_factor)
             cap = max(1, min(cap, N))
 
             out_flat = x_flat.new_zeros(N, h)
 
-            # 공통 full-feature affinity와 sigmoid 게이트(두 스테이지 동일 정의)
-            s_full = self._make_finite(x_flat @ self.expert_centroids.t())        # [N, E]
+            s_full = self._make_finite(x_flat @ self.expert_centroids.t())
             s_full = s_full.to(x_flat.dtype)
-            s_top1 = s_full.gather(1, top1_idx.view(-1,1))                        # [N,1]
-            gate_sigmoid = torch.sigmoid(s_top1)                                  # [N,1]
+            s_top1 = s_full.gather(1, top1_idx.view(-1,1))
+            gate_sigmoid = torch.sigmoid(s_top1)
 
-            # balance loss (Stage-1에서만)
             if (not is_stage2) and self.training and self.stable_balance_alpha > 0:
-                # 논문식: 각 expert에 실제로 라우팅된 토큰들의 σ(s_full) 합을 이용
                 n = float(N) / self.num_experts
                 balance = x_flat.new_zeros(())
                 for eid in range(self.num_experts):
                     idx = (top1_idx == eid).nonzero(as_tuple=True)[0]
                     if idx.numel() == 0:
                         continue
-                    sigma_sum = torch.sigmoid(s_full[idx, eid]).mean()  # sum -> mean 로 스케일 안정화
+                    sigma_sum = torch.sigmoid(s_full[idx, eid]).mean()
                     balance = balance + ((idx.numel() - n) / n) * sigma_sum
                 balance_loss = self.stable_balance_alpha * balance
             else:
                 balance_loss = None
 
-            # expert별 토큰 처리 (용량 초과면 나머지는 패스-스루)
             for eid in range(self.num_experts):
                 idx = (top1_idx == eid).nonzero(as_tuple=True)[0]
                 if idx.numel() == 0:
                     continue
                 keep = idx[:cap]
                 drop = idx[cap:]
-                # overflow rate 로깅용
                 if idx.numel() > 0 and cap > 0:
                     self.last_aux["overflow_rate"] = float(max(idx.numel()-cap, 0)) / float(idx.numel())
 
@@ -837,7 +795,6 @@ class MoELayer(nn.Module):
                     y = y * gate_sigmoid[keep]
                     out_flat[keep] = y
                 if drop.numel() > 0:
-                    # 용량 초과분은 residual 통과
                     out_flat[drop] = x_flat[drop]
 
             routed = out_flat.view(bsz, seq, h)
@@ -854,37 +811,28 @@ class MoELayer(nn.Module):
             return routed, balance_loss, updated_routing_state
 
         elif self.mode == "hypermoe":
-            """
-            HyperMoE: Top-k(noisy) gating + (옵션) HyperNet 기반 Adapter Fusion
-            필요한 설정은 GPT2LayerMoE에서 전달된 self._hypermoe_cfg 딕셔너리에 있음.
-            """
             cfg = getattr(self, "_hypermoe_cfg", None)
             assert cfg is not None, "hypermoe config가 설정되지 않았습니다."
 
-            # 어댑터 파라미터 상태 초기화 (권장사항)
             if hasattr(self, "adapter_layer") and self.adapter_layer is not None:
                 self.adapter_layer.clear_adapter()
 
-            # ---------- forward ----------
             res = x
             x_flat = x.reshape(-1, self.input_size)
             x_flat = x_flat.to(self.w_gate.dtype)
             gates, load, gates_out, expert_mask = noisy_top_k_gating_mixing(self, x_flat, self.training)
             self.last_scores = gates.detach()
             
-            # importance/load balance loss
             importance = gates.sum(0)
             loss_coef = float(cfg.get("loss_coef", 1e-2))
             balance_loss = (cv_squared(importance) + cv_squared(load)) * loss_coef
 
-            # dispatch → experts → combine
             dispatcher = SparseDispatcher(self.n_experts, gates)
             expert_inputs = dispatcher.dispatch(x_flat)
             expert_outputs = [self.experts_hypermoe[i](expert_inputs[i]) if expert_inputs[i].numel() > 0
                               else x_flat.new_zeros((0, self.output_size)) for i in range(self.n_experts)]
             y = dispatcher.combine(expert_outputs).reshape(bsz, seq, self.output_size)
 
-            # (optional) HyperNet adapters fused with unselected experts' embedding summary
             if cfg.get("use_hypernet", True) and hasattr(self, "adapter_layer") and self.adapter_layer is not None:
                 index_out = torch.nonzero(gates_out)[:, -1].contiguous().flatten()
                 emb = self.n_experts_embedding(index_out)
@@ -906,7 +854,6 @@ class MoELayer(nn.Module):
 
         return routed_out, balance_loss, updated_routing_state
 
-# ===== GPT2LayerMoE wrapper =====
 class GPT2LayerMoE(nn.Module):
     def __init__(self, config: GPT2Config, mode="switch",
                  num_experts=8, shared_expert=None, global_experts=None,
@@ -935,16 +882,14 @@ class GPT2LayerMoE(nn.Module):
         )
         self.layer_idx = 0 if layer_idx is None else int(layer_idx)
         setattr(self.moe, "_layer_idx", self.layer_idx)
-        # HyperMoE용 내부 설정 주입
         if mode == "hypermoe":
-            # 기본값 채우기
             d_model = config.n_embd
             defaults = dict(
                 k=1,
                 noisy_gating=True,
                 use_hypernet=True,
                 adapter_dim=max(16, d_model // 32),
-                hypernet_input=d_model,                # 입력은 [B,L,H]에서 H
+                hypernet_input=d_model,
                 hypernetwork_bottleneck=max(64, d_model // 8),
                 layer_emb_dim=8,
                 experts_embedding_dim=32,
@@ -954,9 +899,7 @@ class GPT2LayerMoE(nn.Module):
                 layer_idx=(layer_idx if layer_idx is not None else 0),
             )
             cfg = {**defaults, **(hypermoe_kwargs or {})}
-            # MoELayer 인스턴스에 저장
             setattr(self.moe, "_hypermoe_cfg", cfg)
-            # ★ 미리 모듈/파라미터 등록 (optimizer가 잡을 수 있도록)
             shared_pack = (hypermoe_kwargs or {}).get("_shared_pack", None)
             self.moe._init_hypermoe(cfg, config.n_embd, shared=shared_pack)
 
@@ -968,7 +911,6 @@ class GPT2LayerMoE(nn.Module):
         self.last_balance_loss = balance_loss
         return out, balance_loss, updated_routing_state
 
-# ===== Hash helpers (shared with tools_hash) =====
 def balanced_assignment(freq_dict, num_experts, vocab_size):
     buckets = [[] for _ in range(num_experts)]
     bucket_loads = [0] * num_experts
@@ -1022,7 +964,6 @@ class HashRouter:
     def route(self, token_ids):
         return self.table_tensor[token_ids]
 
-# ===== convert utility =====
 def convert_gpt2_to_moe(
     model,
     config,
@@ -1046,12 +987,10 @@ def convert_gpt2_to_moe(
     shared_router = None
     layer_experts = num_experts
 
-    # --- StableMoE 전용: 전역 공유 파라미터를 루트 모델에 "한 번만" 등록 ---
     if mode == "stablemoe":
         vocab_size = getattr(config, "vocab_size", 50257)
         eff_num_experts = num_experts
         
-        # (A) 루트 모델에 단 한 번만 등록
         if not hasattr(model, "stablemoe_routing_weight"):
             model.register_parameter(
                 "stablemoe_routing_weight",
@@ -1084,10 +1023,8 @@ def convert_gpt2_to_moe(
         xmoe_capacity_factor = float(max(0.5, min(xmoe_capacity_factor, 8.0)))
         print(f"🧮 XMoE γ auto-scale: base_cf={capacity_factor:.2f}, mult={xmoe_expert_mult:.2f} ⇒ γ={xmoe_capacity_factor:.2f}")
 
-    # for-loop 바깥, hypermoe용 공유 팩 생성
     hypermoe_shared_pack = None
     if mode == "hypermoe":
-        # defaults는 아래에서 레이어별로 쓰는 hypermoe_defaults와 동일 스펙 유지
         d_model = config.n_embd
         defaults = dict(
             k=1,
@@ -1101,11 +1038,9 @@ def convert_gpt2_to_moe(
             process_dim=max(64, d_model // 8),
             num_hidden_layers=getattr(config, "n_layer", getattr(config, "num_hidden_layers", 12)),
             loss_coef=1e-2,
-            layer_idx=0,  # 더미, 실제 사용은 forward 인자
+            layer_idx=0,
         )
-        # ★ 모델 최상단에 등록(optimizer가 한 번만 파라미터 잡도록)
         hypermoe_shared_pack = HyperMoEShared(defaults, d_model, num_experts)
-        # 모델 루트에 붙여서 weight 등록 (이름은 취향껏)
         model.hypermoe_shared = hypermoe_shared_pack
 
     for i, block in enumerate(model.transformer.h):
@@ -1121,7 +1056,6 @@ def convert_gpt2_to_moe(
                 layer_idx=i,
             )
         elif mode == "hypermoe":
-            # HyperMoE 기본 파라미터(원 코드에 맞춤)
             hypermoe_defaults = dict(
                 k=1,
                 noisy_gating=True,
@@ -1159,7 +1093,7 @@ def convert_gpt2_to_moe(
                 xmoe_threshold=xmoe_threshold,
                 xmoe_capacity_factor=xmoe_capacity_factor,
                 xmoe_expert_mult=xmoe_expert_mult,
-                layer_idx=i,  # ★ 추가
+                layer_idx=i,
             )
             if mode == "stablemoe":
                 layer.moe.vocab_size = getattr(config, "vocab_size", 50257)

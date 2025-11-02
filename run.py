@@ -1,4 +1,3 @@
-# run.py — CLI 엔트리포인트
 import os, subprocess, shutil, contextlib
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 os.environ.setdefault("HF_HUB_ENABLE_PROGRESS_BARS", "0")
@@ -23,55 +22,40 @@ def _read_cmd(cmd):
         return ""
 
 def _detect_ib():
-    # 가장 안전한 판별: 커널 디바이스 경로 or ibv_devinfo
     if os.path.isdir("/sys/class/infiniband"):
         return True
     if _has_cmd("ibv_devinfo"):
         out = _read_cmd("ibv_devinfo -l")
-        # 장치 목록에 아무 라인이나 있으면 있음으로 간주
         return any(line.strip() for line in out.splitlines() if not line.strip().startswith("RDMA device list"))
     return False
 
 def _detect_gdr():
-    # GPUDirect RDMA 모듈 존재 여부 (이름이 nvidia_peermem 인 경우가 일반적)
     return os.path.exists("/sys/module/nvidia_peermem") or os.path.exists("/dev/nvidia-peer-mem")
 
 def _detect_nvlink():
     if not _has_cmd("nvidia-smi"):
         return False, ""
     topo = _read_cmd("nvidia-smi topo -m")
-    # topo 표에 'NV' (NVLink/NV#) 표기가 있으면 NVLink로 간주
     has_nv = any((" NV" in line or "NVL" in line) for line in topo.splitlines())
     return has_nv, topo
 
 def setup_nccl_env_safely(print_topology_rank0=True):
-    # PyTorch 권장값으로 교체 (NCCL_ASYNC_ERROR_HANDLING은 deprecated)
     os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
-    # 기존 deprecated 환경변수는 제거
     os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
     
-    # OMP 경고 제거 (프로세스당 쓰레드 1 고정; torchrun가 기본 1로 고치지만 명시 권장)
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     
     _setenv_if_missing("NCCL_DEBUG", "WARN")
 
-    # 토폴로지 감지
     has_nvlink, topo_txt = _detect_nvlink()
     has_ib = _detect_ib()
     has_gdr = _detect_gdr()
 
-    # IB 없으면 꺼두기, 있으면 켜기
     _setenv_if_missing("NCCL_IB_DISABLE", "0" if has_ib else "1")
 
-    # GDR은 있을 때만 레벨 지정 (없는데 켜면 실패/회피 로직 타는 클러스터가 있음)
     if has_ib and has_gdr:
-        _setenv_if_missing("NCCL_NET_GDR_LEVEL", "2")  # 보수적으로 2
-    # 없으면 설정 안 함(기존 값 유지)
+        _setenv_if_missing("NCCL_NET_GDR_LEVEL", "2")
 
-    # P2P는 NVLink가 없더라도 일반적으로 자동; 굳이 끌 필요 없음.
-    # 필요 시: os.environ.setdefault("NCCL_P2P_DISABLE", "0")
-
-    # rank0 에서만 토폴로지 프린트 (torch.distributed 초기화 전이므로 RANK env로 판별)
     rank = int(os.environ.get("RANK", "0"))
     if print_topology_rank0 and rank == 0 and topo_txt:
         print("==== NVIDIA Topology (nvidia-smi topo -m) ====")
@@ -79,7 +63,6 @@ def setup_nccl_env_safely(print_topology_rank0=True):
         print("================================================")
         print(f"[NCCL] has_nvlink={has_nvlink}, has_ib={has_ib}, has_gdr={has_gdr}")
 
-# 기타 캐시/메모리 관련 기본값
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("HF_HOME", "/workspace/hf_cache")
@@ -128,10 +111,8 @@ def main():
         create_global_hash_table(num_experts=args.num_experts)
     elif args.cmd == "analysis":
         set_seed(42)
-        # Debug 모드일 때 max_batches를 매우 작게 설정
         debug_max_batches = args.max_batches
         if args.debug and args.max_batches is None:
-            # Debug 모드: 전체의 0.1%만 사용하도록 특별 플래그 전달
             debug_max_batches = "debug"
         
         run_mapping_analysis(

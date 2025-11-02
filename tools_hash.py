@@ -1,4 +1,3 @@
-# tools_hash.py — 해시 테이블 생성기 (전체 코퍼스 스캔)
 import os, torch
 from tqdm import tqdm
 from collections import Counter

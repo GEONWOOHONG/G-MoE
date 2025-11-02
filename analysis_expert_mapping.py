@@ -1,19 +1,3 @@
-"""
-Expert-to-Source Mapping Analysis for Pile Dataset
-
-이 코드는 run.py로 학습한 MoE 모델들을 불러와서
-Pile 데이터셋의 메타데이터(출처 정보)를 활용하여
-각 레이어의 expert가 어떤 출처(source)의 데이터를 처리하는지 분석합니다.
-
-✅ 변경 요약 (ours_com 완전 호환):
-- ours_com일 때 num_experts = base_num_experts + 1 적용
-- ours_com 패치 적용 + shared_router 객체 공유 유지
-- 체크포인트 로드 시 global_experts / shared_router 레이어 전역 복제
-- GPU 이동 후 weight tying(wte↔lm_head) 무조건 재확인/복원
-- 라우팅 통계는 ours_com의 moe.last_scores 우선 사용 (fallback: router.last_scores)
-- 패딩 마스크 제거 후 집계, GShard는 top-2 모두 카운트
-"""
-
 import os
 import math
 import torch
@@ -34,7 +18,6 @@ import warnings
 from scipy.stats import entropy as shannon_entropy
 from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
 
-# (파일 상단 import들 사이에 추가)
 from modeling import (
     convert_gpt2_to_moe,
     GPT2LayerMoE,
@@ -52,7 +35,6 @@ from patches import (
 
 warnings.filterwarnings("ignore")
 
-# === Helpers for new metrics ===
 import numpy as np
 
 def _entropy_from_counts(cnt):
@@ -74,7 +56,6 @@ def _gini(counts):
     return (n + 1 - 2 * (cum.sum() / cum[-1])) / n
 
 def _ece_top1(probs, n_bins=15):
-    # Top-1 이벤트에 대한 calibration proxy (모든 모델 동일 조건)
     bins = np.linspace(0, 1, n_bins + 1)
     idx = np.clip(np.digitize(probs, bins) - 1, 0, n_bins - 1)
     ece = 0.0
@@ -83,7 +64,7 @@ def _ece_top1(probs, n_bins=15):
         if not mask.any(): 
             continue
         conf = float(probs[mask].mean())
-        acc  = 1.0  # top-1 선택 사건 자체를 "정답"으로 취급하는 공정 proxy
+        acc  = 1.0
         ece += mask.mean() * abs(acc - conf)
     return float(ece)
 
