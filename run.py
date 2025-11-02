@@ -84,8 +84,14 @@ os.environ.setdefault("HF_HOME", "/workspace/hf_cache")
 os.environ.setdefault("HF_DATASETS_CACHE", "/workspace/hf_cache/datasets")
 os.makedirs(os.environ["HF_DATASETS_CACHE"], exist_ok=True)
 
-# ★ 추가: 분산 초기화 전에 호출
 setup_nccl_env_safely()
+
+try:
+    import torch
+    if torch.cuda.is_available():
+        os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+except Exception:
+    os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 
 import argparse
 from config import HASH_TABLE_PATH

@@ -120,11 +120,10 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
             print(f"🔹 Loading global hash table from: {HASH_TABLE_PATH}")
         freq_dict = {'__load_from_file__': HASH_TABLE_PATH}
 
-    # ← 모델 만들기/패치 전에 OK. 중요한 건 'rank0이 먼저 한 번 로드' 입니다.
     if is_dist:
         if rank == 0:
-            _ = load_or_prepare_pile()  # 캐시 priming (실제 반환값 버려도 OK)
-        dist.barrier()  # 캐시 완료 대기
+            _ = load_or_prepare_pile(verbose=False)
+        dist.barrier()
 
     trainer_state = None
     if continue_training:
@@ -162,13 +161,15 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
         patch_model_for_ours_com(model)
     elif mode == "stablemoe":
         patch_model_for_stablemoe(model)
-    elif mode != "dense":
-        if is_main():
-            print(f"🔹 Applying forward patches for mode: {mode}")
+    
+    if is_main() and mode != "dense":
+        print(f"🔹 Applying forward patches for mode: {mode}")
+
         patch_model_basic(model)
 
-    train_dataset, valid_dataset = load_or_prepare_pile()
-    print(f"✅ Using FULL datasets: train={len(train_dataset):,}, valid={len(valid_dataset):,}")
+    train_dataset, valid_dataset = load_or_prepare_pile(verbose=is_main())
+    if is_main():
+        print(f"✅ Using FULL datasets: train={len(train_dataset):,}, valid={len(valid_dataset):,}")
 
     train_dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
     valid_dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
@@ -366,7 +367,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
                     main=main_loss.item(),
                     aux=aux_loss.item() if isinstance(aux_loss, torch.Tensor) else 0.0
                 )
-                
+
     if progress_bar: progress_bar.close()
 
     if is_main():
