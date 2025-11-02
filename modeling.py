@@ -150,14 +150,24 @@ class SparseDispatcher:
         return torch.split(inp_exp, self._part_sizes, dim=0)
 
     def combine(self, expert_out, multiply_by_gates=True):
-        stitched = torch.cat(expert_out, 0)
+        stitched = torch.cat(expert_out, 0)  # [S, H] 또는 [S, ...]
         if multiply_by_gates:
-            _nonzero_gates = self._nonzero_gates.unsqueeze(-1) if stitched.dim()==2 else self._nonzero_gates
-            stitched = stitched.mul(_nonzero_gates)
-        if stitched.dim()==2:
-            zeros = torch.zeros(self._gates.size(0), stitched.size(1), device=stitched.device, dtype=stitched.dtype)
+            # self._nonzero_gates: [S, 1] 이어야 함. 안전하게 reshape + dtype/device 정렬
+            g = self._nonzero_gates
+            if g.dim() == 1:
+                g = g.unsqueeze(-1)              # [S] -> [S,1]
+            # 고정: 항상 마지막 축들에 1을 추가해 [S,1,...] 로 맞춰 브로드캐스팅 폭주 방지
+            while g.dim() < stitched.dim():
+                g = g.unsqueeze(-1)
+            g = g.to(device=stitched.device, dtype=stitched.dtype)
+            stitched = stitched * g             # 안전한 브로드캐스팅
+
+        if stitched.dim() == 2:
+            zeros = torch.zeros(self._gates.size(0), stitched.size(1),
+                                device=stitched.device, dtype=stitched.dtype)
         else:
-            zeros = torch.zeros(self._gates.size(0), stitched.size(-2), stitched.size(-1), device=stitched.device, dtype=stitched.dtype)
+            zeros = torch.zeros(self._gates.size(0), stitched.size(-2), stitched.size(-1),
+                                device=stitched.device, dtype=stitched.dtype)
         return zeros.index_add(0, self._batch_index, stitched)
 
     def expert_to_gates(self):
@@ -480,7 +490,12 @@ class MoELayer(nn.Module):
         routed_out = torch.zeros_like(x)
         balance_loss = None
         updated_routing_state = routing_state
-        experts = self.global_experts if self.global_experts is not None else self.experts
+        if self.global_experts is not None:
+            experts = self.global_experts
+        elif hasattr(self, "experts"):
+            experts = self.experts
+        else:
+            experts = None
 
         if self.mode == "dense":
             routed_out = experts[0](x)

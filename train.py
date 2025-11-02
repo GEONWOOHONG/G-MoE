@@ -186,7 +186,6 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, continu
         stage1_ratio = 0.10
         stage1_steps = max(1, int(round(stage1_ratio * total_steps)))
 
-        from modeling import GPT2LayerMoE
         for m in model.modules():
             if isinstance(m, GPT2LayerMoE) and m.mode == "stablemoe":
                 m.moe.stable_stage1_steps = int(stage1_steps)
@@ -229,8 +228,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, continu
             )
             main_loss = outputs.loss
 
-        balance_losses = [m.last_balance_loss for m in model.modules()
-                          if isinstance(m, GPT2LayerMoE) and m.last_balance_loss is not None]
+        balance_losses = [m.last_balance_loss for m in model.modules() if isinstance(m, GPT2LayerMoE) and m.last_balance_loss is not None]
         aux_loss = torch.stack(balance_losses).mean() if balance_losses else 0.0
         loss = main_loss + aux_loss
 
