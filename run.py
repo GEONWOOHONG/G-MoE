@@ -3,6 +3,8 @@ import os, subprocess, shutil, contextlib
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 os.environ.setdefault("HF_HUB_ENABLE_PROGRESS_BARS", "0")
 os.environ.setdefault("HF_DATASETS_VERBOSITY", "warning")
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
 def _setenv_if_missing(k, v):
     if os.environ.get(k) in (None, ""):

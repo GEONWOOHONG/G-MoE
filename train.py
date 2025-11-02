@@ -128,7 +128,6 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
         print("🔄 Loading model from last checkpoint...")
         config = GPT2Config.from_pretrained(save_dir)
         model = GPT2LMHeadModel(config)
-        model.config.loss_type = "ForCausalLMLoss"
         model = convert_gpt2_to_moe(
             model, config, mode=mode, num_experts=eff_num_experts, alpha=0.01, freq_dict=freq_dict
         )
@@ -143,7 +142,6 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     else:
         config = GPT2Config(vocab_size=50257, n_positions=1024, n_ctx=1024, n_embd=1024, n_layer=8, n_head=8)
         model = GPT2LMHeadModel(config)
-        model.config.loss_type = "ForCausalLMLoss"
         stable_args = dict(stable_routing_dim=50, stable_balance_alpha=0.3)
         
         model = convert_gpt2_to_moe(
@@ -216,6 +214,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
             output_device=local_rank,
             gradient_as_bucket_view=True,
             broadcast_buffers=False,
+            find_unused_parameters=True,
         )
     optimizer = get_default_optimizer(model)
 
