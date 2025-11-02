@@ -1,5 +1,5 @@
 # patches.py — GPT2Block/GPT2Model 패치 + 마스크
-import torch, types
+import os, torch, types
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from transformers import GPT2LMHeadModel
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
@@ -122,7 +122,9 @@ def block_moe_forward_patch(
     return ret
 
 def patch_model_for_stablemoe(model: GPT2LMHeadModel):
-    print("🔹 Applying StableMoE forward patches...")
+    rank = int(os.environ.get("RANK", "0"))
+    if rank == 0:
+        print("🔹 Applying StableMoE forward patches...")
     patch_model_basic(model)
 
     # HF GPT2Model.forward를 얇게 감싸서 routing_state와 global_step을 전달/수용
@@ -262,12 +264,16 @@ def patch_model_basic(model: GPT2LMHeadModel):
     model.forward = types.MethodType(patched_lm_forward, model)
 
 def patch_model_for_hash_moe(model: GPT2LMHeadModel):
-    print("🔹 Applying Hash MoE forward patches...")
+    rank = int(os.environ.get("RANK", "0"))
+    if rank == 0:
+        print("🔹 Applying Hash MoE forward patches...")
     patch_model_basic(model)
     return model
 
 def patch_model_for_ours_com(model: GPT2LMHeadModel):
-    print("🔹 Applying ours_com (Inter-Expert Communication) forward patches...")
+    rank = int(os.environ.get("RANK", "0"))
+    if rank == 0:
+        print("🔹 Applying ours_com (Inter-Expert Communication) forward patches...")
     patch_model_basic(model)
 
     def patched_model_forward(self, input_ids=None, past_key_values=None, attention_mask=None,

@@ -147,7 +147,7 @@ if __name__ == "__main__":
     main()
 
 #python run.py train --mode stablemoe --num_experts 16 --batch_size 44 --seq_len 1024 --grad_accum 1
-#torchrun --nproc_per_node=4 --master_port=29600 run.py train --mode stablemoe --num_experts 16 --batch_size 44 --seq_len 1024 --grad_accum 1
+#torchrun --nproc_per_node=2 --master_port=29600 run.py train --mode switch --num_experts 16 --batch_size 44 --seq_len 1024 --grad_accum 1
 
 #cd "/c/IMML Lab/runpod_a100/repo"
 #git status

@@ -107,15 +107,22 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
         print(f"💾 Checkpoint directory: {save_dir}")
 
     eff_num_experts = num_experts * 4 if mode == "xmoe" else num_experts
-    if mode == "xmoe" and eff_num_experts != num_experts:
+    if mode == "xmoe" and eff_num_experts != num_experts and is_main():
         print(f"🧮 xmoe mode: num_experts overridden {num_experts} → {eff_num_experts} (×4)")
 
     freq_dict = None
     if mode == "hash":
         if not os.path.exists(HASH_TABLE_PATH):
             raise FileNotFoundError(f"Hash table not found at {HASH_TABLE_PATH}\nPlease run `create_global_hash_table()` first.")
-        print(f"🔹 Loading global hash table from: {HASH_TABLE_PATH}")
+        if is_main():
+            print(f"🔹 Loading global hash table from: {HASH_TABLE_PATH}")
         freq_dict = {'__load_from_file__': HASH_TABLE_PATH}
+
+    # ← 모델 만들기/패치 전에 OK. 중요한 건 'rank0이 먼저 한 번 로드' 입니다.
+    if is_dist:
+        if rank == 0:
+            _ = load_or_prepare_pile()  # 캐시 priming (실제 반환값 버려도 OK)
+        dist.barrier()  # 캐시 완료 대기
 
     trainer_state = None
     if continue_training:
@@ -154,7 +161,8 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     elif mode == "stablemoe":
         patch_model_for_stablemoe(model)
     elif mode != "dense":
-        print(f"🔹 Applying forward patches for mode: {mode}")
+        if is_main():
+            print(f"🔹 Applying forward patches for mode: {mode}")
         patch_model_basic(model)
 
     train_dataset, valid_dataset = load_or_prepare_pile()

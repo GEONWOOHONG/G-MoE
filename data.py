@@ -24,7 +24,9 @@ def load_or_prepare_pile(
         cache_path=None,
         raw_cache=None):
     cache_dir = os.environ.get("HF_DATASETS_CACHE", None)
-    print(f"🔹 Loading Geonwoohong/pile-uncopyrighted-6b-tokenized-gpt2 (cache_dir={cache_dir})")
+    rank = int(os.environ.get("RANK", "0"))
+    if rank == 0:
+        print(f"🔹 Loading Geonwoohong/pile-uncopyrighted-6b-tokenized-gpt2 (cache_dir={cache_dir})")
     ds = load_dataset(
         "Geonwoohong/pile-uncopyrighted-6b-tokenized-gpt2",
         cache_dir=cache_dir
