@@ -35,6 +35,9 @@ def get_default_scheduler(optimizer, total_steps, warmup_ratio=0.1):
     return scheduler
 
 def save_checkpoint(model, optimizer, scheduler, step, best_loss, total_train_steps, path, name="checkpoint.safetensors"):
+    # DDP 래핑 대응: 실제 모듈로 저장
+    if hasattr(model, "module"):
+        model = model.module
     model_path = os.path.join(path, f"{name}")
     save_model(model, model_path)
     trainer_state = {

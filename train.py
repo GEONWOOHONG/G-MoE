@@ -1,12 +1,14 @@
 # train.py — 학습/평가/통계 (원본 로직 그대로)
-import os, math, torch, tiktoken, shutil
+import os, math, torch, tiktoken, shutil, contextlib
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from transformers import GPT2Config, GPT2LMHeadModel
 from safetensors.torch import load_model
 
 from config import RUNS_DIR, HASH_TABLE_PATH
-from data import load_or_prepare_pile
+from data import load_or_prepare_pile, worker_init_fn, get_dataloader_generator
 from modeling import convert_gpt2_to_moe, GPT2LayerMoE
 from patches import (
     patch_model_basic,
@@ -25,6 +27,15 @@ ensure_flash_attn()  # 원본과 동일하게 모듈 레벨에서 즉시 호출
 
 enc = tiktoken.get_encoding("gpt2")
 
+def init_distributed():
+    """torchrun 환경이면 DDP 초기화하고 (is_dist, rank, world_size, local_rank) 반환"""
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        return True, dist.get_rank(), dist.get_world_size(), local_rank
+    return False, 0, 1, 0
+
 @torch.no_grad()
 def evaluate(model, dataloader, device):
     model.eval()
@@ -41,11 +52,16 @@ def evaluate(model, dataloader, device):
                 # >>> 추가: 평가 시엔 항상 Stage-2 사용
                 global_step=(1 << 62),
             )
-            losses.append(outputs.loss.item())
+            losses.append(outputs.loss.detach())
+    # 로컬 평균
+    mean_loss = torch.stack(losses).mean()
+    # 분산 평균
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(mean_loss, op=dist.ReduceOp.SUM)
+        mean_loss = mean_loss / dist.get_world_size()
     model.train()
-    mean_loss = sum(losses) / len(losses)
-    ppl = math.exp(mean_loss)
-    return mean_loss, ppl
+    ppl = math.exp(mean_loss.item())
+    return mean_loss.item(), ppl
 
 def compute_moe_stats(model, config, mode):
     moe_layers = [m.moe for m in model.modules() if isinstance(m, GPT2LayerMoE)]
@@ -80,11 +96,15 @@ def compute_moe_stats(model, config, mode):
             balance_scores.append(entropy)
     return {"balance": sum(balance_scores) / len(balance_scores) if balance_scores else 0.0}
 
-def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, continue_training=False):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_accum=1, continue_training=False):
+    is_dist, rank, world_size, local_rank = init_distributed()
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    def is_main(): return (not is_dist) or (rank == 0)
+    
     save_dir = f"/workspace/checkpoints/{mode}_exp1"
     os.makedirs(save_dir, exist_ok=True)
-    print(f"💾 Checkpoint directory: {save_dir}")
+    if is_main():
+        print(f"💾 Checkpoint directory: {save_dir}")
 
     eff_num_experts = num_experts * 4 if mode == "xmoe" else num_experts
     if mode == "xmoe" and eff_num_experts != num_experts:
@@ -144,24 +164,53 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, continu
     valid_dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
 
     NUM_WORKERS = max(1, os.cpu_count() // 2)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=NUM_WORKERS,
-                              pin_memory=True, prefetch_factor=2, persistent_workers=True)
-    valid_loader = DataLoader(valid_dataset, batch_size=batch_size, num_workers=NUM_WORKERS,
-                              pin_memory=True, prefetch_factor=2, persistent_workers=True, shuffle=False)
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset) if is_dist else None
+    valid_sampler = torch.utils.data.distributed.DistributedSampler(valid_dataset, shuffle=False) if is_dist else None
+    
+    # 워커 시드 고정을 위한 Generator 생성
+    train_generator = get_dataloader_generator(rank if is_dist else 0)
+    valid_generator = get_dataloader_generator(rank if is_dist else 0)
+    
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size,
+        shuffle=(train_sampler is None), sampler=train_sampler,
+        num_workers=NUM_WORKERS, pin_memory=True, prefetch_factor=2, persistent_workers=True,
+        worker_init_fn=worker_init_fn, generator=train_generator
+    )
+    valid_loader = DataLoader(
+        valid_dataset, batch_size=batch_size, shuffle=False,
+        sampler=valid_sampler, num_workers=NUM_WORKERS,
+        pin_memory=True, prefetch_factor=2, persistent_workers=True,
+        worker_init_fn=worker_init_fn, generator=valid_generator
+    )
 
     from utils import print_model_info as _pmi
-    _pmi(model, config, mode, eff_num_experts, batch_size=batch_size, grad_accum_steps=1, effective_batch=batch_size)
+    if is_main():
+        _pmi(model, config, mode, eff_num_experts, batch_size=batch_size, grad_accum_steps=grad_accum,
+             effective_batch=batch_size * (world_size if is_dist else 1) * grad_accum)
 
-    if not os.path.exists(os.path.join(save_dir, "config.json")):
+    if is_main() and not os.path.exists(os.path.join(save_dir, "config.json")):
         config.save_pretrained(save_dir)
 
     model.to(device)
+    base_model = model  # 저장/통계용 원본
+    if is_dist:
+        model = DDP(
+            model, 
+            device_ids=[local_rank], 
+            output_device=local_rank, 
+            find_unused_parameters=False,
+            gradient_as_bucket_view=True,   # bucket 뷰 사용으로 메모리/속도 이점
+            broadcast_buffers=False         # 불필요한 buffer 브로드캐스트 비활성 (통계 buffer 없으면 권장)
+        )
     optimizer = get_default_optimizer(model)
 
     runs_root = RUNS_DIR
-    if os.path.exists(runs_root):
-        shutil.rmtree(runs_root)
-    writer = SummaryWriter(log_dir=os.path.join(runs_root, "exp1"))
+    writer = None
+    if is_main():
+        if os.path.exists(runs_root):
+            shutil.rmtree(runs_root)
+        writer = SummaryWriter(log_dir=os.path.join(runs_root, "exp1"))
 
     if continue_training and trainer_state is not None:
         optimizer.load_state_dict(trainer_state["optimizer"])
@@ -190,8 +239,9 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, continu
             if isinstance(m, GPT2LayerMoE) and m.mode == "stablemoe":
                 m.moe.stable_stage1_steps = int(stage1_steps)
 
-        print(f"🧭 StableMoE schedule: Stage-1 = {stage1_steps} steps "
-            f"({stage1_ratio*100:.1f}% of {total_steps}), Stage-2 thereafter.")
+        if is_main():
+            print(f"🧭 StableMoE schedule: Stage-1 = {stage1_steps} steps "
+                  f"({stage1_ratio*100:.1f}% of {total_steps}), Stage-2 thereafter.")
         
         # Stage-2 진입 시 명시적 고정 보장 (안전 가드)
         print("🔒 StableMoE: Pre-freezing routing components for Stage-2 safety...")
@@ -201,79 +251,101 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, continu
                 # 논문: Stage-2에서 D(·)와 Ě를 동결
                 pass  # forward에서 _maybe_freeze_stage2()가 처리하지만, 명시적 준비
         
-        writer.add_scalar("stablemoe/stage1_steps", stage1_steps, 0)
-        writer.add_text("stablemoe/config",
-                        f"stage1_ratio={stage1_ratio}, total_steps={total_steps}", 0)
+        if writer:
+            writer.add_scalar("stablemoe/stage1_steps", stage1_steps, 0)
+            writer.add_text("stablemoe/config",
+                            f"stage1_ratio={stage1_ratio}, total_steps={total_steps}", 0)
     
     tokens_per_batch = batch_size * seq_len
     total_tokens = len(train_loader) * tokens_per_batch
-    print(f"🔹 Training for 1 epoch = {len(train_loader):,} steps ≈ {total_tokens/1e9:.2f}B tokens")
+    if is_main():
+        print(f"🔹 Training for 1 epoch = {len(train_loader):,} steps ≈ {total_tokens/1e9:.2f}B tokens")
 
-    progress_bar = tqdm(total=len(train_loader), desc="Training", leave=True)
+    progress_bar = tqdm(total=len(train_loader), desc=f"Training (rank {rank})", leave=True) if is_main() else None
     total_train_steps = total_steps
     point_one_step = max(1, total_train_steps // 1000)
     five_percent_interval = max(1, total_train_steps // 20)
 
+    if is_dist and train_sampler is not None:
+        train_sampler.set_epoch(0)  # 단일 epoch 구조
     for step, batch in enumerate(train_loader, start=start_step + 1):
         input_ids = batch["input_ids"].to(device)
         labels = input_ids.clone()
         labels[labels == enc.eot_token] = -100
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=batch["attention_mask"].to(device),
-                labels=labels,
-                global_step=step,
-            )
-            main_loss = outputs.loss
+        # 마이크로스텝 통신 억제
+        sync_now = (step % grad_accum) == 0
+        ddp_ctx = torch.no_grad if not is_dist else (model.no_sync if not sync_now else (lambda: contextlib.nullcontext))
+        with (ddp_ctx() if is_dist and hasattr(model, "no_sync") and not sync_now else contextlib.nullcontext()):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=batch["attention_mask"].to(device),
+                    labels=labels,
+                    global_step=step,
+                )
+                main_loss = outputs.loss
 
-        balance_losses = [m.last_balance_loss for m in model.modules() if isinstance(m, GPT2LayerMoE) and m.last_balance_loss is not None]
-        aux_loss = torch.stack(balance_losses).mean() if balance_losses else 0.0
-        loss = main_loss + aux_loss
+            balance_losses = [m.last_balance_loss for m in model.modules() if isinstance(m, GPT2LayerMoE) and m.last_balance_loss is not None]
+            aux_loss = torch.stack(balance_losses).mean() if balance_losses else 0.0
+            loss = main_loss + aux_loss
 
-        # stablemoe 보조 로스 분해 로깅
-        if mode == "stablemoe":
-            balances, distills, overflows = [], [], []
-            for m in model.modules():
-                if isinstance(m, GPT2LayerMoE) and hasattr(m, "moe") and isinstance(getattr(m, "moe", None), type(model.transformer.h[0].mlp.moe)):
-                    aux = m.moe.last_aux
-                    if aux:
-                        if aux["balance"] is not None: balances.append(float(aux["balance"]))
-                        if aux["distill"]  is not None: distills.append(float(aux["distill"]))
-                        if aux["overflow_rate"] is not None: overflows.append(float(aux["overflow_rate"]))
-            if balances: writer.add_scalar("stablemoe/balance_loss", sum(balances)/len(balances), step)
-            if distills: writer.add_scalar("stablemoe/distill_loss",  sum(distills)/len(distills), step)
-            if overflows: writer.add_scalar("stablemoe/overflow_rate", sum(overflows)/len(overflows), step)
+            # stablemoe 보조 로스 분해 로깅
+            if mode == "stablemoe":
+                balances, distills, overflows = [], [], []
+                for m in model.modules():
+                    if isinstance(m, GPT2LayerMoE) and hasattr(m, "moe") and isinstance(getattr(m, "moe", None), type(model.transformer.h[0].mlp.moe)):
+                        aux = m.moe.last_aux
+                        if aux:
+                            if aux["balance"] is not None: balances.append(float(aux["balance"]))
+                            if aux["distill"]  is not None: distills.append(float(aux["distill"]))
+                            if aux["overflow_rate"] is not None: overflows.append(float(aux["overflow_rate"]))
+                if balances and writer: writer.add_scalar("stablemoe/balance_loss", sum(balances)/len(balances), step)
+                if distills and writer: writer.add_scalar("stablemoe/distill_loss",  sum(distills)/len(distills), step)
+                if overflows and writer: writer.add_scalar("stablemoe/overflow_rate", sum(overflows)/len(overflows), step)
 
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step()
-        optimizer.zero_grad()
+            # === Gradient Accumulation ===
+            (loss / grad_accum).backward()
 
-        progress_bar.update(1)
-        progress_bar.set_postfix(loss=loss.item(), main=main_loss.item(),
-                                 aux=aux_loss.item() if isinstance(aux_loss, torch.Tensor) else 0.0)
-        writer.add_scalar("train/loss", loss.item(), step)
+        # <-- 여기서만 클립/스텝
+        if sync_now:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        if progress_bar:
+            progress_bar.update(1)
+            progress_bar.set_postfix(loss=loss.item(), main=main_loss.item(),
+                                     aux=aux_loss.item() if isinstance(aux_loss, torch.Tensor) else 0.0)
+        if writer:
+            writer.add_scalar("train/loss", loss.item(), step)
 
         if step % five_percent_interval == 0 or step == point_one_step:
             msg = (f"🔍 Full validation (every 5%) at step {step}..."
                    if step % five_percent_interval == 0 else f"🔍 Quick validation (0.1%) at step {step}...")
-            progress_bar.write(msg)
+            if progress_bar:
+                progress_bar.write(msg)
+            # 평가/통계는 DDP 래핑 모델이 아니라 base_model(원본 모듈) 참조 X → forward는 model 사용
             valid_loss, valid_ppl = evaluate(model, valid_loader, device)
-            stats = compute_moe_stats(model, config, mode) if step % five_percent_interval == 0 else {"balance": 0.0}
-            if step % five_percent_interval == 0:
-                progress_bar.write(f"[Step {step}] Valid Loss {valid_loss:.4f}, PPL {valid_ppl:.2f}, Balance {stats['balance']:.4f}")
-                writer.add_scalar("valid/balance", stats["balance"], step)
-            writer.add_scalar("valid/loss", valid_loss, step)
-            writer.add_scalar("valid/ppl", valid_ppl, step)
-            if valid_loss < best_loss:
-                best_loss = valid_loss
-                save_checkpoint(model, optimizer, scheduler, step, best_loss, total_train_steps, save_dir, "best_checkpoint.safetensors")
+            stats = compute_moe_stats(base_model, config, mode) if (step % five_percent_interval == 0) else {"balance": 0.0}
+            if is_main():
+                if step % five_percent_interval == 0:
+                    print(f"[Step {step}] Valid Loss {valid_loss:.4f}, PPL {valid_ppl:.2f}, Balance {stats['balance']:.4f}")
+                    if writer:
+                        writer.add_scalar("valid/balance", stats["balance"], step)
+                if writer:
+                    writer.add_scalar("valid/loss", valid_loss, step)
+                    writer.add_scalar("valid/ppl", valid_ppl, step)
+                if valid_loss < best_loss:
+                    best_loss = valid_loss
+                    save_checkpoint(base_model, optimizer, scheduler, step, best_loss, total_train_steps, save_dir, "best_checkpoint.safetensors")
 
-        if step % 50 == 0:
+        if writer and step % 50 == 0:
             writer.add_scalar("train/lr", scheduler.get_last_lr()[0], step)
 
-    progress_bar.close()
-    save_checkpoint(model, optimizer, scheduler, step, best_loss, total_train_steps, save_dir, "last_checkpoint.safetensors")
+    if progress_bar: progress_bar.close()
+    if is_main():
+        save_checkpoint(base_model, optimizer, scheduler, step, best_loss, total_train_steps, save_dir, "last_checkpoint.safetensors")
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
