@@ -402,17 +402,10 @@ class MoELayer(nn.Module):
             self.expert_centroids = nn.Parameter(torch.empty(num_experts, d_model))
             nn.init.orthogonal_(self.expert_centroids, gain=0.1)
 
-            # 경량 라우터 임베딩 (word-embedding 대용; default 50d)
+            # 기본 설정값들 (convert_gpt2_to_moe에서 주입됨)
             self.stable_routing_dim = getattr(self, "stable_routing_dim", 50)
             self.vocab_size = getattr(self, "vocab_size", 50257)
-            self.routing_emb = nn.Embedding(self.vocab_size, self.stable_routing_dim)
-
-            # distilled centroids (Stage-1의 타깃 & Stage-2 라우팅에 사용)
-            self.distill_expert_centroids = nn.Parameter(
-                torch.empty(num_experts, self.stable_routing_dim)
-            )
-            nn.init.orthogonal_(self.distill_expert_centroids, gain=0.1)
-
+            
             # 스케줄/로스 계수 (train.py에서 주입; 여기선 기본값 미설정)
             self.stable_stage1_steps = None
             self.stable_balance_alpha = getattr(self, "stable_balance_alpha", 0.3)
@@ -420,6 +413,10 @@ class MoELayer(nn.Module):
             # 내부 업데이트 카운터(옵션)
             self.register_buffer("_num_updates_buf", torch.zeros((), dtype=torch.long))
             self._stage2_frozen = False
+            
+            # 전역 공유 파라미터 참조는 convert_gpt2_to_moe에서 주입됨
+            self._stable_routing_weight = None  # Tensor 참조
+            self._stable_distill_E = None       # Tensor 참조
 
         elif global_experts is None and mode not in {"hypermoe"}:
             self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(num_experts)])
@@ -691,8 +688,9 @@ class MoELayer(nn.Module):
                 if input_ids is None:
                     raise ValueError("stablemoe mode requires input_ids for routing.")
                 with torch.no_grad():  # stage2 라우팅 고정
-                    rfeat = self.routing_emb(input_ids.view(-1))          # [N, rdim]
-                affinities = rfeat @ self.distill_expert_centroids.t()    # [N, E]
+                    # 전역 공유 weight를 함수형 embedding으로 조회
+                    rfeat = F.embedding(input_ids.view(-1), self._stable_routing_weight)    # ✅
+                affinities = rfeat @ self._stable_distill_E.t()                          # ✅
                 distill_loss = None
             else:
                 # Stage-1: full feat로 라우팅 + distill target/CE
@@ -706,10 +704,12 @@ class MoELayer(nn.Module):
                         pass
                 if input_ids is None:
                     raise ValueError("stablemoe mode requires input_ids during Stage-1.")
+                # distill target 생성은 동일
                 with torch.no_grad():
                     target = affinities.argmax(dim=1)                    # [N]
-                rfeat = self.routing_emb(input_ids.view(-1))              # [N, rdim]
-                logits_d = rfeat @ self.distill_expert_centroids.t()      # [N, E]
+                # 경량 라우터 logits_d = E_routing(x_ids) · E_distill^T
+                rfeat = F.embedding(input_ids.view(-1), self._stable_routing_weight)    # ✅
+                logits_d = rfeat @ self._stable_distill_E.t()                            # ✅
                 distill_loss = F.cross_entropy(logits_d, target, reduction="mean")
 
             # --- greedy top-1 assignment + capacity 컷 ---
@@ -957,9 +957,27 @@ def convert_gpt2_to_moe(
     shared_router = None
     layer_experts = num_experts
 
-    # --- StableMoE 전용: 모든 레이어가 공유할 라우터 weight와 distilled centroids ---
-    shared_routing_weight = None
-    shared_distill_E = None
+    # --- StableMoE 전용: 전역 공유 파라미터를 루트 모델에 "한 번만" 등록 ---
+    if mode == "stablemoe":
+        vocab_size = getattr(config, "vocab_size", 50257)
+        eff_num_experts = num_experts
+        
+        # (A) 루트 모델에 단 한 번만 등록
+        if not hasattr(model, "stablemoe_routing_weight"):
+            model.register_parameter(
+                "stablemoe_routing_weight",
+                nn.Parameter(torch.empty(vocab_size, stable_routing_dim))
+            )
+            nn.init.normal_(model.stablemoe_routing_weight, mean=0.0, std=0.02)
+            print(f"🔹 StableMoE: Registered shared routing weight ({vocab_size}, {stable_routing_dim})")
+
+        if not hasattr(model, "stablemoe_distill_E"):
+            model.register_parameter(
+                "stablemoe_distill_E",
+                nn.Parameter(torch.empty(eff_num_experts, stable_routing_dim))
+            )
+            nn.init.orthogonal_(model.stablemoe_distill_E, gain=0.1)
+            print(f"🔹 StableMoE: Registered shared distilled centroids ({eff_num_experts}, {stable_routing_dim})")
 
     if mode == "ours_com":
         assert num_experts >= 2, "ours_com requires at least 2 experts (1 local + N global)."
@@ -1057,25 +1075,9 @@ def convert_gpt2_to_moe(
                 layer.moe.stable_routing_dim = stable_routing_dim
                 layer.moe.stable_balance_alpha = stable_balance_alpha
                 
-                # 1) shared weight / shared distill_E 최초 1회 생성
-                if shared_routing_weight is None:
-                    shared_routing_weight = nn.Parameter(
-                        torch.empty(layer.moe.vocab_size, layer.moe.stable_routing_dim)
-                    )
-                    nn.init.normal_(shared_routing_weight, mean=0.0, std=0.02)  # 임의 초기화
-                    print(f"🔹 StableMoE: Created shared routing weight ({layer.moe.vocab_size}, {layer.moe.stable_routing_dim})")
-                if shared_distill_E is None:
-                    shared_distill_E = nn.Parameter(
-                        torch.empty(layer.moe.num_experts, layer.moe.stable_routing_dim)
-                    )
-                    nn.init.orthogonal_(shared_distill_E, gain=0.1)
-                    print(f"🔹 StableMoE: Created shared distilled centroids ({layer.moe.num_experts}, {layer.moe.stable_routing_dim})")
-
-                # 2) 각 레이어는 "자기 임베딩 모듈"을 갖되, weight는 모두 같은 파라미터를 바라보게 tying
-                layer.moe.routing_emb = nn.Embedding(layer.moe.vocab_size, layer.moe.stable_routing_dim)
-                layer.moe.routing_emb.weight = shared_routing_weight  # <-- 핵심: 파라미터 공유
-
-                # 3) distill_E도 동일 파라미터 객체를 공유
-                layer.moe.distill_expert_centroids = shared_distill_E
+                # (B) 각 레이어에는 "참조"만 심는다 (등록 X)
+                layer.moe._stable_routing_weight = model.stablemoe_routing_weight   # Tensor 참조
+                layer.moe._stable_distill_E      = model.stablemoe_distill_E        # Tensor 참조
+                
             block.mlp = layer
     return model

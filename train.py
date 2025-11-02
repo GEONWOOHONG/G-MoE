@@ -6,7 +6,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from transformers import GPT2Config, GPT2LMHeadModel
 from safetensors.torch import load_model
-
+import torch.nn.functional as F
 from config import RUNS_DIR, HASH_TABLE_PATH
 from data import load_or_prepare_pile, worker_init_fn, get_dataloader_generator
 from modeling import convert_gpt2_to_moe, GPT2LayerMoE
@@ -24,6 +24,43 @@ from torch.utils.tensorboard import SummaryWriter
 ensure_flash_attn()  # 원본과 동일하게 모듈 레벨에서 즉시 호출
 
 enc = tiktoken.get_encoding("gpt2")
+
+def chunked_cross_entropy(logits, labels, ignore_index=-100, chunk_tokens=8192):
+    """
+    GPT-2 계열은 HF가 내부에서 CE 계산 시 shift를 합니다.
+    여기서도 동일하게 직접 shift 후, BT 축을 chunk로 나눠 CE를 계산해 피크 메모리 절감.
+    logits: [B, T, V], labels: [B, T]
+    """
+    # 1) GPT2-style shift (next-token prediction)
+    shift_logits = logits[:, :-1, :].contiguous()    # [B, T-1, V]
+    shift_labels = labels[:, 1:].contiguous()        # [B, T-1]
+
+    B, Tm1, V = shift_logits.shape
+    bt = B * Tm1
+
+    # 2) BT x V 로 펴서 chunk-by-chunk로 CE 계산
+    flat_logits = shift_logits.view(bt, V)
+    flat_labels = shift_labels.view(bt)
+
+    total = 0.0
+    valid = 0
+    for start in range(0, bt, chunk_tokens):
+        end = min(start + chunk_tokens, bt)
+        loss = F.cross_entropy(
+            flat_logits[start:end],
+            flat_labels[start:end],
+            ignore_index=ignore_index,
+            reduction="sum",
+        )
+        total += loss
+        # 유효 토큰 수 (ignore_index 제외)
+        if ignore_index is not None:
+            valid += (flat_labels[start:end] != ignore_index).sum().item()
+        else:
+            valid += (end - start)
+
+    denom = max(valid, 1)
+    return total / denom
 
 def init_distributed():
     """torchrun 환경이면 DDP 초기화하고 (is_dist, rank, world_size, local_rank) 반환"""
@@ -48,14 +85,15 @@ def evaluate(model, dataloader, device):
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=batch["attention_mask"].to(device),
-                labels=labels,
-                # >>> 추가: 평가 시엔 항상 Stage-2 사용
+                labels=None,
+                use_cache=False,
                 global_step=(1 << 62),
             )
-            losses.append(outputs.loss.detach())
-    # 로컬 평균
+            logits = outputs.logits
+            loss = chunked_cross_entropy(logits, labels, ignore_index=-100, chunk_tokens=8192)
+            losses.append(loss.detach())
+
     mean_loss = torch.stack(losses).mean()
-    # 분산 평균
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(mean_loss, op=dist.ReduceOp.SUM)
         mean_loss = mean_loss / dist.get_world_size()
@@ -308,10 +346,12 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
                     outputs = model(
                         input_ids=input_ids,
                         attention_mask=batch["attention_mask"].to(device),
-                        labels=labels,
+                        labels=None,
+                        use_cache=False,
                         global_step=step,
                     )
-                    main_loss = outputs.loss
+                    logits = outputs.logits
+                    main_loss = chunked_cross_entropy(logits, labels, ignore_index=-100, chunk_tokens=8192)
 
                 balance_losses = [m.last_balance_loss for m in model.modules()
                                 if isinstance(m, GPT2LayerMoE) and m.last_balance_loss is not None]
