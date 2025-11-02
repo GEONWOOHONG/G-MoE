@@ -250,6 +250,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
             gradient_as_bucket_view=True,
             broadcast_buffers=False,
             find_unused_parameters=True,
+            static_graph=True,
         )
     optimizer = get_default_optimizer(model)
 
