@@ -365,6 +365,24 @@ class MoELayer(nn.Module):
             self.proj_gamma_beta = None
             if self.cond_dim != d_model:
                 self.proj_gamma_beta = nn.Linear(self.cond_dim, d_model, bias=False)
+
+        elif mode == "ours_refine":
+            self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(1)])
+            self.num_experts = len(global_experts)
+            assert shared_router is not None, "ours_refine requires a shared_router"
+            self.shared_router = shared_router
+
+            self.cond_dim = self.shared_router.gru.hidden_size
+            self.score_dim = self.num_experts
+            self.h_ln = nn.LayerNorm(self.cond_dim)
+
+            self.prev_score_ln   = nn.LayerNorm(self.score_dim)
+            self.prev_score_proj = nn.Linear(self.score_dim, self.cond_dim, bias=False)
+
+            self.gate_head = nn.Linear(self.cond_dim * 2, self.num_experts, bias=False)
+
+            self.last_scores = None
+
         elif mode == "hash":
             self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(num_experts)])
             self.hash_router = HashRouter(
@@ -626,6 +644,67 @@ class MoELayer(nn.Module):
                 aux_loss = (aux_loss if aux_loss is not None else 0.0) + probe
 
             return routed_out, aux_loss, h_new
+
+        elif self.mode == "ours_refine":
+            h_new = self.shared_router(x, h_prev=(routing_state["h"] if isinstance(routing_state, dict) else routing_state))
+            h_feat = self.h_ln(h_new)
+
+            N = h_feat.size(0)
+            if isinstance(routing_state, dict) and ("logits" in routing_state) and (routing_state["logits"] is not None):
+                prev_logits = routing_state["logits"]
+                prev_logits = prev_logits.to(h_feat.dtype)
+            else:
+                prev_logits = h_feat.new_zeros((N, self.score_dim))
+
+            prev_feat = self.prev_score_proj(self.prev_score_ln(prev_logits))
+
+            gate_in = torch.cat([h_feat, prev_feat], dim=-1)
+            logits = self.gate_head(gate_in)
+            scores = F.softmax(logits, dim=-1)
+            self.last_scores = scores.detach()
+
+            B, T, H = x.shape
+            local_out = self.experts[0](x)
+    
+            top_scores, top_idx = torch.topk(scores, k=1, dim=-1)
+            x_flat = x.view(-1, H)
+            out_flat = torch.zeros_like(x_flat)
+            top_idx_flat = top_idx.view(-1)
+            top_scores_flat = top_scores.view(-1, 1)
+            for eid in range(len(self.global_experts)):
+                idx = (top_idx_flat == eid).nonzero(as_tuple=True)[0]
+                if idx.numel() > 0:
+                    expert_out = self.global_experts[eid](x_flat[idx]) * top_scores_flat[idx]
+                    out_flat[idx] = expert_out.to(out_flat.dtype)
+            global_out = out_flat.view_as(x)
+
+            aux_loss = None
+            if self.training and getattr(self, "aux_alpha", 0.01) > 0.0:
+                one_hot = torch.nn.functional.one_hot(top_idx_flat, num_classes=self.num_experts).float()
+                freq = one_hot.mean(0)
+                Pi   = scores.mean(0)
+                fi   = freq * self.num_experts
+                aux_loss = (Pi * fi).sum() * self.aux_alpha
+
+            routed_out = local_out + global_out
+
+            alpha = getattr(self, "ddp_probe_alpha", 1e-8)
+            probe = self._ddp_probe_loss(dtype=x.dtype, device=x.device, alpha=alpha)
+            if hasattr(self, "global_experts") and self.global_experts is not None:
+                d = self.d_model
+                p = torch.randn(8, d, device=x.device, dtype=x.dtype) * 1e-3
+                g_loss = None
+                for e in self.global_experts:
+                    y = e(p); l = (y**2).mean()
+                    g_loss = l if g_loss is None else (g_loss + l)
+                if g_loss is not None:
+                    probe = (probe if probe is not None else 0.0) + alpha * g_loss
+            if probe is not None:
+                aux_loss = (aux_loss if aux_loss is not None else 0.0) + probe
+
+            updated_routing_state = {"h": h_new, "logits": logits.detach()}
+
+            return routed_out, aux_loss, updated_routing_state
 
         elif self.mode == "hash":
             if input_ids is None:
@@ -1016,6 +1095,15 @@ def convert_gpt2_to_moe(
         shared_router = RecurrentRouter(d_model=config.n_embd, hidden_dim=config.n_embd)
         layer_experts = 1
 
+    if mode == "ours_refine":
+        assert num_experts >= 2, "ours_refine requires at least 2 experts (1 local + N global)."
+        global_experts = nn.ModuleList([
+            Expert(config.n_embd, config.n_embd * 4, initializer_range=config.initializer_range)
+            for _ in range(num_experts - 1)
+        ])
+        shared_router = RecurrentRouter(d_model=config.n_embd, hidden_dim=config.n_embd)
+        layer_experts = 1
+
     if mode == "xmoe":
         if xmoe_capacity_factor is None:
             scale = 1.0 / max(1e-6, float(xmoe_expert_mult))
@@ -1045,6 +1133,17 @@ def convert_gpt2_to_moe(
 
     for i, block in enumerate(model.transformer.h):
         if mode == "ours_com":
+            block.mlp = GPT2LayerMoE(
+                config, mode, layer_experts,
+                shared_expert=None,
+                global_experts=global_experts,
+                alpha=alpha,
+                capacity_factor=capacity_factor,
+                freq_dict=None,
+                shared_router=shared_router,
+                layer_idx=i,
+            )
+        elif mode == "ours_refine":
             block.mlp = GPT2LayerMoE(
                 config, mode, layer_experts,
                 shared_expert=None,

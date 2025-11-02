@@ -329,7 +329,8 @@ def patch_model_for_ours_com(model: GPT2LMHeadModel):
         for i, block in enumerate(self.h):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
-
+            
+            global_step = kwargs.get("global_step", None)
             outputs = block(
                 hidden_states,
                 past_key_values=past_key_values[i] if past_key_values is not None else None,
@@ -341,6 +342,7 @@ def patch_model_for_ours_com(model: GPT2LMHeadModel):
                 use_cache=use_cache,
                 output_attentions=output_attentions,
                 routing_state=routing_state,
+                global_step=global_step,
             )
 
             hidden_states = outputs[0]

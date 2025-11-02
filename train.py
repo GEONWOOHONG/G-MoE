@@ -64,33 +64,43 @@ def init_distributed():
 
 @torch.no_grad()
 def evaluate(model, dataloader, device):
-    is_main = (not dist.is_available()) or (not dist.is_initialized()) or (dist.get_rank() == 0)
+    is_dist = torch.distributed.is_available() and torch.distributed.is_initialized()
     model.eval()
-    losses = []
-    it = tqdm(dataloader, desc="Validating", leave=False) if is_main else dataloader
+    total_loss = torch.tensor(0.0, device=device)
+    total_count = torch.tensor(0.0, device=device)
+
+    it = dataloader
     for batch in it:
         input_ids = batch["input_ids"].to(device)
         labels = input_ids.clone()
         labels[labels == enc.eot_token] = -100
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            outputs = model(
+            logits = model(
                 input_ids=input_ids,
                 attention_mask=batch["attention_mask"].to(device),
                 labels=None,
                 use_cache=False,
                 global_step=(1 << 62),
+            ).logits
+            loss_sum = F.cross_entropy(
+                logits[:, :-1, :].contiguous().view(-1, logits.size(-1)),
+                labels[:, 1:].contiguous().view(-1),
+                ignore_index=-100,
+                reduction="sum",
             )
-            logits = outputs.logits
-            loss = chunked_cross_entropy(logits, labels, ignore_index=-100, chunk_tokens=8192)
-            losses.append(loss.detach())
+            count = (labels[:, 1:] != -100).sum()
 
-    mean_loss = torch.stack(losses).mean()
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(mean_loss, op=dist.ReduceOp.SUM)
-        mean_loss = mean_loss / dist.get_world_size()
+        total_loss += loss_sum
+        total_count += count
+
+    if is_dist:
+        torch.distributed.all_reduce(total_loss, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(total_count, op=torch.distributed.ReduceOp.SUM)
+
+    mean_loss = (total_loss / torch.clamp(total_count, min=1)).item()
+    ppl = math.exp(mean_loss)
     model.train()
-    ppl = math.exp(mean_loss.item())
-    return mean_loss.item(), ppl
+    return mean_loss, ppl
 
 def compute_moe_stats(model, config, mode):
     moe_layers = [m.moe for m in model.modules() if isinstance(m, GPT2LayerMoE)]
@@ -101,6 +111,11 @@ def compute_moe_stats(model, config, mode):
         if moe.mode == "hash":
             continue
         if moe.mode == "ours_com" and getattr(moe, "last_scores", None) is not None:
+            probs = moe.last_scores.mean(0)
+            entropy = -(probs * (probs + 1e-9).log()).sum().item()
+            balance_scores.append(entropy)
+            continue
+        if moe.mode == "ours_refine" and getattr(moe, "last_scores", None) is not None:
             probs = moe.last_scores.mean(0)
             entropy = -(probs * (probs + 1e-9).log()).sum().item()
             balance_scores.append(entropy)
@@ -188,6 +203,8 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
         patch_model_for_hash_moe(model)
     elif mode == "ours_com":
         patch_model_for_ours_com(model)
+    elif mode == "ours_refine":
+        patch_model_for_ours_com(model)
     else:
         patch_model_basic(model)
 
@@ -237,7 +254,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            gradient_as_bucket_view=False,
+            gradient_as_bucket_view=True,
             broadcast_buffers=False,
             find_unused_parameters=False,
             static_graph=False,
