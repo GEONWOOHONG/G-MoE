@@ -411,7 +411,7 @@ class MoELayer(nn.Module):
             self.register_buffer("_num_updates_buf", torch.zeros((), dtype=torch.long))
             self._stage2_frozen = False
 
-        elif global_experts is None:
+        elif global_experts is None and mode not in {"hypermoe"}:
             self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(num_experts)])
 
     def _init_hypermoe(self, cfg, h, shared: Optional[nn.Module]=None):
