@@ -406,16 +406,13 @@ class MoELayer(nn.Module):
             self.stable_routing_dim = getattr(self, "stable_routing_dim", 50)
             self.vocab_size = getattr(self, "vocab_size", 50257)
             
-            # 스케줄/로스 계수 (train.py에서 주입; 여기선 기본값 미설정)
             self.stable_stage1_steps = None
             self.stable_balance_alpha = getattr(self, "stable_balance_alpha", 0.3)
 
-            # 내부 업데이트 카운터(옵션)
             self.register_buffer("_num_updates_buf", torch.zeros((), dtype=torch.long))
             self._stage2_frozen = False
             
-            # 루트 모델 참조만 들고 있고, 파라미터는 루트에만 등록
-            self._stable_root = None            # weakref.proxy(model) 또는 model
+            self._stable_root_ref = None
 
         elif global_experts is None and mode not in {"hypermoe"}:
             self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(num_experts)])
@@ -687,7 +684,7 @@ class MoELayer(nn.Module):
                 if input_ids is None:
                     raise ValueError("stablemoe mode requires input_ids for routing.")
                 with torch.no_grad():  # stage2 라우팅 고정
-                    root = self._stable_root
+                    root = self._stable_root_ref() if hasattr(self, "_stable_root_ref") else None
                     assert root is not None, "StableMoE root ref missing"
                     rfeat = F.embedding(input_ids.view(-1), root.stablemoe_routing_weight)
                 affinities = rfeat @ root.stablemoe_distill_E.t()
@@ -708,7 +705,7 @@ class MoELayer(nn.Module):
                 with torch.no_grad():
                     target = affinities.argmax(dim=1)                    # [N]
                 # 경량 라우터 logits_d = E_routing(x_ids) · E_distill^T
-                root = self._stable_root
+                root = self._stable_root_ref() if hasattr(self, "_stable_root_ref") else None
                 assert root is not None, "StableMoE root ref missing"
                 rfeat = F.embedding(input_ids.view(-1), root.stablemoe_routing_weight)
                 logits_d = rfeat @ root.stablemoe_distill_E.t()
@@ -1077,10 +1074,8 @@ def convert_gpt2_to_moe(
                 layer.moe.stable_routing_dim = stable_routing_dim
                 layer.moe.stable_balance_alpha = stable_balance_alpha
                 
-                # 파라미터 자체를 서브모듈에 다시 등록하지 말 것!
-                # 루트 모델에만 등록하고, 레이어에는 루트 참조만 저장
                 import weakref
-                layer.moe._stable_root = weakref.proxy(model)  # 또는 그냥 model 참조를 넣어도 됨
+                object.__setattr__(layer.moe, "_stable_root_ref", weakref.ref(model))
                 
             block.mlp = layer
     return model
