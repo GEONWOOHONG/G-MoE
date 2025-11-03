@@ -4,6 +4,9 @@ from transformers import get_cosine_schedule_with_warmup
 import torch.optim as optim
 import torch.nn.functional as F
 
+def _is_rank0() -> bool:
+    return os.environ.get("RANK", "0") == "0"
+
 CURRENT_INPUT_IDS = None
 def set_current_input_ids(x):
     global CURRENT_INPUT_IDS
@@ -30,6 +33,8 @@ def get_default_scheduler(optimizer, total_steps, warmup_ratio=0.1):
         num_warmup_steps=warmup_steps,
         num_training_steps=total_steps
     )
+    if _is_rank0():
+        print(f"🗓️ Scheduler: cosine (warmup_ratio={warmup_ratio:.3f}, warmup_steps={warmup_steps}, total_steps={total_steps})")
     return scheduler
 
 def save_checkpoint(model, optimizer, scheduler, step, best_loss, total_train_steps, path, name="checkpoint.safetensors"):
@@ -90,25 +95,47 @@ def ensure_flash_attn():
     try:
         spec = importlib.util.find_spec("flash_attn")
         if spec is None:
-            print("🔹 Installing FlashAttention...")
+            if _is_rank0():
+                print("🔹 Installing FlashAttention (flash-attn==2.7.4.post1)...")
             subprocess.check_call([
                 sys.executable, "-m", "pip", "install",
                 "flash-attn==2.7.4.post1", "--no-build-isolation"
             ])
+            if _is_rank0():
+                try:
+                    import flash_attn as _fa
+                    ver = getattr(_fa, "__version__", "unknown")
+                    print(f"✅ FlashAttention installed: {ver}")
+                except Exception:
+                    print("✅ FlashAttention installed.")
+        else:
+            if _is_rank0():
+                try:
+                    import flash_attn as _fa
+                    ver = getattr(_fa, "__version__", "unknown")
+                    print(f"✅ FlashAttention found: {ver}")
+                except Exception:
+                    print("✅ FlashAttention found.")
     except Exception as e:
-        print("⚠️ FlashAttention install failed:", e)
+        if _is_rank0():
+            print("⚠️ FlashAttention install failed:", e)
 
 def get_default_optimizer(model):
+    params = (p for p in model.parameters() if p.requires_grad)
     try:
-        return optim.AdamW(
-            (p for p in model.parameters() if p.requires_grad),
-            lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1, fused=True
+        opt = optim.AdamW(
+            params, lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1, fused=True
         )
+        if _is_rank0():
+            print("🧪 Optimizer: AdamW (fused=True)")
+        return opt
     except TypeError:
-        return optim.AdamW(
-            (p for p in model.parameters() if p.requires_grad),
-            lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1
+        opt = optim.AdamW(
+            params, lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1
         )
+        if _is_rank0():
+            print("🧪 Optimizer: AdamW (fused unsupported → fallback)")
+        return opt
     
 def chunked_cross_entropy(logits, labels, ignore_index=-100, chunk_tokens=8192):
     shift_logits = logits[:, :-1, :].contiguous()

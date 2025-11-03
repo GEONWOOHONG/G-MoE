@@ -197,8 +197,13 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     train_dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
     valid_dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
 
-    per_gpu_workers = max(2, (os.cpu_count() // (world_size if is_dist else 1)) // 2)
-    NUM_WORKERS = per_gpu_workers
+    logical_cpus = os.cpu_count() or 2
+    gpus = (world_size if is_dist else 1)
+    computed = max(2, (logical_cpus // gpus) // 2)
+    NUM_WORKERS = min(8, computed)
+
+    if is_main():
+        print(f"🧵 DataLoader workers per GPU: computed={computed} → using={NUM_WORKERS}")
 
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset) if is_dist else None
     valid_sampler = torch.utils.data.distributed.DistributedSampler(valid_dataset, shuffle=False) if is_dist else None
@@ -217,6 +222,10 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
         if has_pin_dev:
             pin_kwargs["pin_memory_device"] = f"cuda:{local_rank}"
 
+    if is_main():
+        print(f"📌 DataLoader pin_memory={pin_kwargs.get('pin_memory', False)}, "
+              f"pin_memory_device={pin_kwargs.get('pin_memory_device', 'cpu')}")
+        
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -333,7 +342,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     progress_bar = tqdm(total=len(train_loader), desc=f"Training (rank {rank})", leave=True) if is_main() else None
     total_train_steps = total_steps
     point_one_step = max(1, total_train_steps // 1000)
-    five_percent_interval = max(1, total_train_steps // 20)
+    five_percent_interval = max(1, total_train_steps // 10)
 
     remaining_optim_steps = total_steps - start_step
     if remaining_optim_steps <= 0 and is_main():

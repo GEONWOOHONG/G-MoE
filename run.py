@@ -140,40 +140,10 @@ if __name__ == "__main__":
 #python run.py train --mode stablemoe --num_experts 16 --batch_size 44 --seq_len 1024 --grad_accum 1
 #torchrun --nproc_per_node=2 --master_port=29600 run.py train --mode switch --num_experts 16 --batch_size 44 --seq_len 1024 --grad_accum 1
 
-#cd "/c/IMML Lab/runpod_a100/repo"
-#git status
-#git add .
-#git commit -m "context"
-#git push origin main
-
-#mv /workspace/checkpoints/exp1 /workspace/checkpoints/gshard_exp1
-
-#rm -rf /workspace/checkpoints/exp1
-#rm -rf /workspace/runs
-
+#apt update && apt install -y nano zip unzip && pip install transformers datasets tensorboard pandas tqdm scipy tiktoken safetensors huggingface_hub hf_transfer
 #tensorboard --logdir=/workspace/runs --host=0.0.0.0 --port=6006
-#watch -n 5 nvidia-smi
-
-#apt-get update && apt-get install -y zip unzip
-#apt update && apt install -y nano
-#pip install transformers datasets tensorboard pandas tqdm scipy tiktoken safetensors huggingface_hub hf_transfer
 
 #wget https://github.com/schollz/croc/releases/download/v10.2.5/croc_v10.2.5_Linux-64bit.tar.gz
 #tar xzf croc_v10.2.5_Linux-64bit.tar.gz
 #mv croc /usr/local/bin/
 #croc --version
-
-#croc send --transfers 8 /workspace/checkpoints
-#croc send /workspace/checkpoints/masking_experiment_8experts.csv
-#cd "C:\IMML Lab"
-#croc <코드값>
-
-#bias=False + kaiming_uniform_ 초기화를 통해서 dead expert 방지해야함
-#top-2 이상일 때 선택 확률을 normalize 해야함
-
-#Fused Kernel / Flash Attention
-#Compile 모드
-
-#export HF_HOME=/workspace/hf_cache
-#export HF_DATASETS_CACHE=/workspace/hf_cache/datasets
-#export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
