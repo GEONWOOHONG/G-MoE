@@ -5,13 +5,14 @@ os.environ.setdefault("HF_DATASETS_CACHE", HF_DATASETS_CACHE)
 
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block as _GPT2Block
 _ORIG_GPT2BLOCK_FORWARD = _GPT2Block.forward
-import math, time, re, numpy as np, torch
+import time, re, numpy as np, torch
 
 from torch.utils.data import DataLoader
 from transformers import GPT2Config, GPT2LMHeadModel
 from datasets import load_dataset
 from tqdm import tqdm
 import pandas as pd
+from contextlib import nullcontext
 
 from data import load_or_prepare_pile, worker_init_fn, get_dataloader_generator
 from modeling import convert_gpt2_to_moe, GPT2LayerMoE
@@ -26,53 +27,6 @@ from utils import ensure_flash_attn, set_seed
 
 CHECKPOINT_ROOT = "/workspace/checkpoints"
 HASH_TABLE_PATH = "/workspace/checkpoints/hash_exp1/global_hash_router_table.pt"
-
-def _attn_flops_per_layer(B, T, d, H):
-    return (4 * B * T * d * d) + (2 * B * T * T * d)
-
-def _mlp_flops_dense_per_layer(B, T, d, d_ff):
-    return 2 * B * T * d * d_ff
-
-def _theoretical_k(mode):
-    return {
-        "dense":1, "switch":1, "hash":1,
-        "gshard":2, "ours_com":2, "ours_refine":2,
-        "hypermoe":1,
-    }.get(mode, 1)
-
-def _ensure_calflops():
-    try:
-        import calflops
-        from calflops import calculate_flops
-        return calculate_flops
-    except Exception as e:
-        print(f"[calflops] not installed/usable: {e}")
-        return None
-
-@torch.no_grad()
-def measure_flops_calflops(model, input_ids, attention_mask, print_detailed=False):
-    calculate_flops = _ensure_calflops()
-    if calculate_flops is None:
-        return None
-    model.eval()
-    kwargs = {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-    }
-    try:
-        flops, macs, params = calculate_flops(
-            model=model,
-            kwargs=kwargs,
-            print_results=print_detailed,
-            print_detailed=print_detailed,
-            output_as_string=False,
-        )
-    except Exception as e:
-        print(f"[calflops] measure failed: {e}")
-        return None
-    B, T = input_ids.shape[:2]
-    flops_per_token = float(flops) / max(1, B*T)
-    return float(flops), float(macs), int(params), flops_per_token
 
 def _replicate_ours_com_weights(model, f, checkpoint_keys, model_keys, loaded_keys):
     sr_src_layer = None
@@ -160,53 +114,138 @@ def load_or_prepare_owt1m():
     cache_dir = os.environ.get("HF_DATASETS_CACHE", None)
     return load_dataset("Geonwoohong/openwebtext-1m-tokenized-gpt2", cache_dir=cache_dir)
 
+@torch.no_grad()
+def measure_prefill_throughput(model, batch, dtype=torch.bfloat16, warmup=5, iters=20):
+    device = next(model.parameters()).device
+    input_ids = batch["input_ids"].to(device, non_blocking=True)
+    attn = batch["attention_mask"].to(device, non_blocking=True)
+    B, T = input_ids.shape
+    total_tokens = B * T
+    ctx = torch.autocast("cuda", dtype=dtype) if device.type == "cuda" else nullcontext()
+    model.eval()
+    for _ in range(warmup):
+        with ctx:
+            _ = model(input_ids=input_ids, attention_mask=attn, use_cache=False).logits
+        if device.type == "cuda": torch.cuda.synchronize()
+    if device.type == "cuda":
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    times = []
+    for _ in range(iters):
+        if device.type == "cuda": start.record()
+        t0 = time.perf_counter()
+        with ctx:
+            _ = model(input_ids=input_ids, attention_mask=attn, use_cache=False).logits
+        if device.type == "cuda":
+            end.record(); torch.cuda.synchronize()
+            dt_ms = start.elapsed_time(end)
+        else:
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+        times.append(dt_ms)
+    avg_ms = sum(times) / len(times)
+    toks_per_s = total_tokens / (avg_ms / 1000.0)
+    return {
+        "prefill_tokens_per_s": float(toks_per_s),
+        "prefill_ms_per_iter": float(avg_ms),
+        "Prefill_B": int(B),
+        "Prefill_T": int(T)
+    }
+
+@torch.no_grad()
+def measure_decode_throughput(model, prompt_ids, gen_len=50, dtype=torch.bfloat16, warmup=20):
+    device = next(model.parameters()).device
+    B, T0 = prompt_ids.shape
+    ctx = torch.autocast("cuda", dtype=dtype) if device.type == "cuda" else nullcontext()
+    model.eval()
+    with ctx:
+        out = model(input_ids=prompt_ids, use_cache=True)
+    past = out.past_key_values
+    x = prompt_ids[:, -1:]
+    for _ in range(warmup):
+        with ctx:
+            out = model(input_ids=x, past_key_values=past, use_cache=True)
+        past = out.past_key_values
+        x = out.logits.argmax(-1)
+    if device.type == "cuda": torch.cuda.synchronize()
+    step_times = []
+    if device.type == "cuda":
+        s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+        s.record()
+    t0 = time.perf_counter()
+    with ctx:
+        out = model(input_ids=x, past_key_values=past, use_cache=True)
+    if device.type == "cuda":
+        e.record(); torch.cuda.synchronize()
+        first_ms = s.elapsed_time(e)
+    else:
+        first_ms = (time.perf_counter() - t0) * 1000.0
+    ttft_ms = float(first_ms)
+    past = out.past_key_values
+    x = out.logits.argmax(-1)
+    for _ in range(max(0, gen_len - 1)):
+        if device.type == "cuda":
+            s, e = torch.cuda.Event(True), torch.cuda.Event(True); s.record()
+        t0 = time.perf_counter()
+        with ctx:
+            out = model(input_ids=x, past_key_values=past, use_cache=True)
+        if device.type == "cuda":
+            e.record(); torch.cuda.synchronize()
+            dt = s.elapsed_time(e)
+        else:
+            dt = (time.perf_counter() - t0) * 1000.0
+        step_times.append(float(dt))
+        past = out.past_key_values
+        x = out.logits.argmax(-1)
+    if step_times:
+        avg_ms_per_tok = sum(step_times) / len(step_times)
+    else:
+        avg_ms_per_tok = ttft_ms
+    toks_per_s = 1000.0 / avg_ms_per_tok
+    return {
+        "decode_tokens_per_s": float(toks_per_s),
+        "decode_ms_per_token": float(avg_ms_per_tok),
+        "decode_TTFT_ms": float(ttft_ms),
+        "Decode_B": int(B),
+        "Decode_T0": int(T0),
+        "Decode_gen": int(gen_len)
+    }
+
 def run_all_tests(batch_size=44, base_num_experts=16):
     set_seed(42)
     ensure_flash_attn()
     _, pile_valid = load_or_prepare_pile(verbose=True)
     pile_valid.set_format(type="torch", columns=["input_ids", "attention_mask"])
     pile_valid = pile_valid.select(range(int(0.1 * len(pile_valid))))
-    
     wt = load_or_prepare_wt103()
     wt_test = wt["test"]
     wt_test.set_format(type="torch", columns=["input_ids", "attention_mask"])
-
     cc100 = load_or_prepare_cc100()
     cc100_test = cc100["test"]
     cc100_test.set_format(type="torch", columns=["input_ids", "attention_mask"])
-
     owt = load_or_prepare_owt1m()
     owt_test = owt["test"]
     owt_test.set_format(type="torch", columns=["input_ids", "attention_mask"])
-
     num_workers = min(8, max(2, ((os.cpu_count() or 8)//2)))
-
     wt_loader = DataLoader(wt_test, batch_size=batch_size, shuffle=False,
-                        num_workers=num_workers, pin_memory=True,
-                        prefetch_factor=2, persistent_workers=False,
-                        worker_init_fn=worker_init_fn,
-                        generator=get_dataloader_generator(0))
-
+                           num_workers=num_workers, pin_memory=True,
+                           prefetch_factor=2, persistent_workers=False,
+                           worker_init_fn=worker_init_fn,
+                           generator=get_dataloader_generator(0))
     cc100_loader = DataLoader(cc100_test, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers, pin_memory=True,
-                            prefetch_factor=2, persistent_workers=False,
-                            worker_init_fn=worker_init_fn,
-                            generator=get_dataloader_generator(0))
-
+                              num_workers=num_workers, pin_memory=True,
+                              prefetch_factor=2, persistent_workers=False,
+                              worker_init_fn=worker_init_fn,
+                              generator=get_dataloader_generator(0))
     owt_loader = DataLoader(owt_test, batch_size=batch_size, shuffle=False,
                             num_workers=num_workers, pin_memory=True,
                             prefetch_factor=2, persistent_workers=False,
                             worker_init_fn=worker_init_fn,
                             generator=get_dataloader_generator(0))
-    
     pile_loader = DataLoader(pile_valid, batch_size=batch_size, shuffle=False,
                              num_workers=num_workers, pin_memory=True,
                              prefetch_factor=2, persistent_workers=False,
                              worker_init_fn=worker_init_fn,
                              generator=get_dataloader_generator(0))
-    
     candidate_modes = ["dense","switch","gshard","hash","stablemoe","xmoe","ours_com","ours_refine","hypermoe"]
-    
     def pick_ckpt(mode):
         d = os.path.join(CHECKPOINT_ROOT, f"{mode}_exp1")
         if not os.path.isdir(d):
@@ -224,26 +263,21 @@ def run_all_tests(batch_size=44, base_num_experts=16):
             if os.path.exists(p):
                 return p
         return None
-    
     available = {m: pick_ckpt(m) for m in candidate_modes}
     available = {m:p for m,p in available.items() if p}
     if not available:
         print("No checkpoints available for evaluation. Please run training first.")
         return
-    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     results = {}
-
     for mode, ckpt_path in available.items():
         inp = msk = batch = None
         it = None
         model = None
         print(f"\n=== Evaluating [{mode}] ===")
         per = {"Checkpoint": ckpt_path}
-
         try:
             _GPT2Block.forward = _ORIG_GPT2BLOCK_FORWARD
-
             cfg_dir = os.path.dirname(ckpt_path)
             cfg_path = os.path.join(cfg_dir, "config.json")
             if os.path.exists(cfg_path):
@@ -253,9 +287,7 @@ def run_all_tests(batch_size=44, base_num_experts=16):
                     vocab_size=50257, n_positions=1024, n_ctx=1024,
                     n_embd=1024, n_layer=8, n_head=8
                 )
-
             model = GPT2LMHeadModel(config)
-
             if mode != "dense":
                 if mode in ("ours_com", "ours_refine"):
                     eff_num_experts = base_num_experts + 1
@@ -263,18 +295,15 @@ def run_all_tests(batch_size=44, base_num_experts=16):
                     eff_num_experts = base_num_experts * 4
                 else:
                     eff_num_experts = base_num_experts
-
                 extra = {}
                 if mode == "hash":
                     extra["freq_dict"] = {"__load_from_file__": HASH_TABLE_PATH}
                 if mode == "stablemoe":
                     extra.update(dict(stable_routing_dim=50, stable_balance_alpha=0.3))
-
                 model = convert_gpt2_to_moe(
                     model, config, mode=mode,
                     num_experts=eff_num_experts, alpha=0.01, **extra
                 )
-
             if mode == "hash":
                 patch_model_for_hash_moe(model)
             elif mode in ("ours_com", "ours_refine"):
@@ -283,67 +312,39 @@ def run_all_tests(batch_size=44, base_num_experts=16):
                 patch_model_for_stablemoe(model)
             elif mode != "dense":
                 patch_model_basic(model)
-
             strict_flag = (mode not in ("ours_com", "ours_refine"))
             load_model_from_safetensors(model, ckpt_path, strict=strict_flag, mode=mode)
-
             model.to(device)
             try:
                 model.lm_head.weight = model.transformer.wte.weight
             except Exception:
                 pass
-
             total_params = sum(p.numel() for p in model.parameters())
             per["Total Params"] = total_params
 
-            sample_batches = 3
-            emp_flops_tok_vals, emp_flops_total_vals = [], []
-            emp_params = None
-            it = iter(pile_loader)
-            for _ in range(sample_batches):
-                try:
-                    batch = next(it)
-                except StopIteration:
-                    break
-                inp = batch["input_ids"].to(device, non_blocking=True)
-                msk = batch["attention_mask"].to(device, non_blocking=True)
-                r = measure_flops_calflops(model, inp, msk, print_detailed=False)
-                if r is None:
-                    break
-                tot_flops, tot_macs, params, flops_tok = r
-                emp_flops_tok_vals.append(flops_tok)
-                emp_flops_total_vals.append(tot_flops)
-                emp_params = params
-
-            if emp_flops_tok_vals:
-                per["FLOPs/token (empirical, Pile)"] = float(np.mean(emp_flops_tok_vals))
-                per["FLOPs (empirical, per-batch avg)"] = float(np.mean(emp_flops_total_vals))
-                per["Params (from calflops)"] = emp_params
-            else:
-                per["FLOPs/token (empirical, Pile)"] = float("nan")
-                per["FLOPs (empirical, per-batch avg)"] = float("nan")
-                per["Params (from calflops)"] = total_params
-
-            T_fix, B_fix = 1024, 1
-            d, H, L = config.n_embd, config.n_head, config.n_layer
-            attn_fix = L * _attn_flops_per_layer(B_fix, T_fix, d, H)
-            d_ff_dense = d * 4
-            if mode == "xmoe":
-                try:
-                    d_ff_exp = model.transformer.h[0].mlp.moe.experts[0].w1.out_features
-                except Exception:
-                    d_ff_exp = d_ff_dense
-                k_eff = 1.0
-                mlp_fix = L * _mlp_flops_dense_per_layer(B_fix, T_fix, d, d_ff_exp) * k_eff
-            else:
-                mlp_fix = L * _mlp_flops_dense_per_layer(B_fix, T_fix, d, d_ff_dense) * _theoretical_k(mode)
-            per["FLOPs/token (theoretical @T=1024)"] = (attn_fix + mlp_fix) / (B_fix * T_fix)
+            sample_batch = next(iter(pile_loader))
+            pref = measure_prefill_throughput(model, sample_batch, dtype=torch.bfloat16, warmup=5, iters=20)
+            per.update({
+                "Prefill tokens/s": pref["prefill_tokens_per_s"],
+                "Prefill ms/iter": pref["prefill_ms_per_iter"],
+                "Prefill_B": pref["Prefill_B"],
+                "Prefill_T": pref["Prefill_T"],
+            })
+            prompt_ids = sample_batch["input_ids"][:, :128].to(device, non_blocking=True)
+            dec = measure_decode_throughput(model, prompt_ids, gen_len=50, dtype=torch.bfloat16, warmup=20)
+            per.update({
+                "Decode tokens/s": dec["decode_tokens_per_s"],
+                "Decode ms/token": dec["decode_ms_per_token"],
+                "Decode TTFT (ms)": dec["decode_TTFT_ms"],
+                "Decode_B": dec["Decode_B"],
+                "Decode_T0": dec["Decode_T0"],
+                "Decode_gen": dec["Decode_gen"],
+            })
 
             wt_loss, _   = eval_ppl_only(model, wt_loader,   device, show_bar=True, desc=f"WT103 {mode}")
             cc100_loss, _ = eval_ppl_only(model, cc100_loader, device, show_bar=True, desc=f"CC100 {mode}")
             owt_loss, _   = eval_ppl_only(model, owt_loader, device, show_bar=True, desc=f"OWT1M {mode}")
             pile_loss, _  = eval_ppl_only(model, pile_loader, device, show_bar=True, desc=f"Pile {mode}")
-
             stats = compute_moe_stats(model, config, mode)
             per.update({
                 "WikiText-103 Loss": wt_loss,
@@ -352,32 +353,28 @@ def run_all_tests(batch_size=44, base_num_experts=16):
                 "Pile Valid Loss": pile_loss,
                 "Expert Balance (entropy)": stats.get("balance", 0.0),
             })
-
             print(
                 f"{mode}: WT103-Loss={wt_loss:.4f}, CC100-Loss={cc100_loss:.4f}, "
                 f"OWT1M-Loss={owt_loss:.4f}, Pile-Loss={pile_loss:.4f}, "
-                f"Balance={per['Expert Balance (entropy)']:.4f}"
+                f"Balance={per['Expert Balance (entropy)']:.4f}, "
+                f"Prefill tok/s={per['Prefill tokens/s']:.1f}, Decode tok/s={per['Decode tokens/s']:.1f}, "
+                f"Decode ms/tok={per['Decode ms/token']:.2f}, TTFT ms={per['Decode TTFT (ms)']:.1f}"
             )
-
             results[mode] = per
-
         finally:
             if torch.cuda.is_available():
                 try: torch.cuda.synchronize()
                 except Exception: pass
-
             inp = None; msk = None; batch = None; it = None
             if model is not None:
                 try: model.to('cpu')
                 except Exception: pass
                 del model
-
             import gc
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
-
     if results:
         df = pd.DataFrame(results).T
         out = os.path.join(CHECKPOINT_ROOT, "test_results_wt103_cc100_owt_pile.csv")
