@@ -391,11 +391,6 @@ class MoELayer(nn.Module):
                 method="balanced",
                 freq_dict=freq_dict
             )
-        elif mode == "expert_choice":
-            self.experts = nn.ModuleList([Expert(d_model, d_ff, use_gelu=True) for _ in range(num_experts)])
-            self.router = nn.Linear(d_model, num_experts, bias=False)
-            self.capacity_factor = capacity_factor
-            nn.init.normal_(self.router.weight, mean=0.0, std=0.02)
         elif mode in {"switch", "gshard"}:
             self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(num_experts)])
             self.router = Router(d_model, num_experts, top_k=(1 if mode=="switch" else 2), alpha=alpha)
@@ -728,32 +723,6 @@ class MoELayer(nn.Module):
             balance_loss = probe
 
             return routed_out, None, updated_routing_state
-
-        elif self.mode == "expert_choice":
-            num_tokens = bsz * seq
-            x_flat = x.view(-1, h)
-            router_logits = self.router(x_flat)
-            balance_loss = None
-            top_k = int(self.capacity_factor * num_tokens / self.num_experts)
-            top_k = max(1, min(top_k, num_tokens))
-            affinity_scores = F.softmax(router_logits, dim=-1)
-            self.last_scores = affinity_scores.detach()
-            weights, selected_tokens = torch.topk(affinity_scores.T, top_k, dim=-1)
-            out_flat = x_flat.new_zeros(x_flat.size())
-            for eid in range(self.num_experts):
-                token_indices = selected_tokens[eid]
-                expert_input = x_flat[token_indices]
-                if expert_input.numel() > 0:
-                    expert_output = self.experts[eid](expert_input).to(out_flat.dtype)
-                    score = weights[eid].unsqueeze(-1)
-                    out_flat.index_add_(0, token_indices, expert_output * score)
-            routed_out = out_flat.view(bsz, seq, h)
-
-            probe = self._ddp_probe_loss(dtype=x.dtype, device=x.device, alpha=getattr(self, "ddp_probe_alpha", 1e-8))
-            if probe is not None:
-                balance_loss = (balance_loss if balance_loss is not None else 0.0) + probe
-
-            return routed_out, balance_loss, updated_routing_state
 
         elif self.mode == "xmoe":
             final_mask, scores_sel, aux_loss, top1_idx = self.xmoe_router(x)
