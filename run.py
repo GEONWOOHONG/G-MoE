@@ -143,6 +143,7 @@ if __name__ == "__main__":
 
 #python run.py train --mode stablemoe --num_experts 16 --batch_size 44 --seq_len 1024 --grad_accum 1
 #torchrun --nproc_per_node=2 --master_port=29600 run.py train --mode switch --num_experts 16 --batch_size 44 --seq_len 1024 --grad_accum 1
+#python run.py eval --batch_size 44 --num_experts 16
 
 #apt update && apt install -y nano zip unzip && pip install transformers datasets tensorboard pandas tqdm scipy tiktoken safetensors huggingface_hub hf_transfer calflops
 #tensorboard --logdir=/workspace/runs --host=0.0.0.0 --port=6006
