@@ -1,6 +1,8 @@
 import os, math, random, numpy as np, torch
 from safetensors.torch import save_model
 from transformers import get_cosine_schedule_with_warmup
+import torch.optim as optim
+import torch.nn.functional as F
 
 CURRENT_INPUT_IDS = None
 def set_current_input_ids(x):
@@ -18,11 +20,9 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
-
-def get_default_optimizer(model, lr=2.5e-4, weight_decay=0.1):
-    from torch.optim import AdamW
-    return AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=weight_decay)
-
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+    
 def get_default_scheduler(optimizer, total_steps, warmup_ratio=0.1):
     warmup_steps = int(total_steps * warmup_ratio)
     scheduler = get_cosine_schedule_with_warmup(
@@ -97,3 +97,44 @@ def ensure_flash_attn():
             ])
     except Exception as e:
         print("⚠️ FlashAttention install failed:", e)
+
+def get_default_optimizer(model):
+    try:
+        return optim.AdamW(
+            (p for p in model.parameters() if p.requires_grad),
+            lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1, fused=True
+        )
+    except TypeError:
+        return optim.AdamW(
+            (p for p in model.parameters() if p.requires_grad),
+            lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1
+        )
+    
+def chunked_cross_entropy(logits, labels, ignore_index=-100, chunk_tokens=8192):
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+
+    B, Tm1, V = shift_logits.shape
+    bt = B * Tm1
+
+    flat_logits = shift_logits.view(bt, V)
+    flat_labels = shift_labels.view(bt)
+
+    total = 0.0
+    valid = 0
+    for start in range(0, bt, chunk_tokens):
+        end = min(start + chunk_tokens, bt)
+        loss = F.cross_entropy(
+            flat_logits[start:end],
+            flat_labels[start:end],
+            ignore_index=ignore_index,
+            reduction="sum",
+        )
+        total += loss
+        if ignore_index is not None:
+            valid += (flat_labels[start:end] != ignore_index).sum().item()
+        else:
+            valid += (end - start)
+
+    denom = max(valid, 1)
+    return total / denom

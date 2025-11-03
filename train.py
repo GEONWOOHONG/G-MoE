@@ -5,53 +5,26 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from transformers import GPT2Config, GPT2LMHeadModel
 from safetensors.torch import load_model
-import torch.nn.functional as F
 from config import RUNS_DIR, HASH_TABLE_PATH
 from data import load_or_prepare_pile, worker_init_fn, get_dataloader_generator
 from modeling import convert_gpt2_to_moe, GPT2LayerMoE
+
 from patches import (
     patch_model_basic,
     patch_model_for_hash_moe,
     patch_model_for_ours_com,
     patch_model_for_stablemoe,
 )
-from utils import (set_seed, get_default_optimizer, get_default_scheduler,
-                   print_model_info, save_checkpoint, ensure_flash_attn)
+
+from utils import (
+    set_seed, get_default_optimizer, get_default_scheduler,
+    print_model_info, save_checkpoint, ensure_flash_attn,
+    chunked_cross_entropy,
+)
 
 from torch.utils.tensorboard import SummaryWriter
 
-ensure_flash_attn()
-
 enc = tiktoken.get_encoding("gpt2")
-
-def chunked_cross_entropy(logits, labels, ignore_index=-100, chunk_tokens=8192):
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = labels[:, 1:].contiguous()
-
-    B, Tm1, V = shift_logits.shape
-    bt = B * Tm1
-
-    flat_logits = shift_logits.view(bt, V)
-    flat_labels = shift_labels.view(bt)
-
-    total = 0.0
-    valid = 0
-    for start in range(0, bt, chunk_tokens):
-        end = min(start + chunk_tokens, bt)
-        loss = F.cross_entropy(
-            flat_logits[start:end],
-            flat_labels[start:end],
-            ignore_index=ignore_index,
-            reduction="sum",
-        )
-        total += loss
-        if ignore_index is not None:
-            valid += (flat_labels[start:end] != ignore_index).sum().item()
-        else:
-            valid += (end - start)
-
-    denom = max(valid, 1)
-    return total / denom
 
 def init_distributed():
     """torchrun 환경이면 DDP 초기화하고 (is_dist, rank, world_size, local_rank) 반환"""
@@ -63,42 +36,49 @@ def init_distributed():
     return False, 0, 1, 0
 
 @torch.no_grad()
-def evaluate(model, dataloader, device):
+def evaluate(model, dataloader, device, show_bar=False, desc="Valid"):
     is_dist = torch.distributed.is_available() and torch.distributed.is_initialized()
-    model.eval()
-    total_loss = torch.tensor(0.0, device=device)
-    total_count = torch.tensor(0.0, device=device)
+    is_main = (not is_dist) or (dist.get_rank() == 0)
 
-    it = dataloader
+    model.eval()
+
+    total_loss_sum = torch.tensor(0.0, device=device)
+    total_valid    = torch.tensor(0.0, device=device)
+
+    it = (tqdm(dataloader, desc=desc, leave=False, dynamic_ncols=True, position=1)
+          if (show_bar and is_main) else dataloader)
+
     for batch in it:
-        input_ids = batch["input_ids"].to(device)
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        attn      = batch["attention_mask"].to(device, non_blocking=True)
+
         labels = input_ids.clone()
         labels[labels == enc.eot_token] = -100
+
         with torch.autocast("cuda", dtype=torch.bfloat16):
             logits = model(
                 input_ids=input_ids,
-                attention_mask=batch["attention_mask"].to(device),
+                attention_mask=attn,
                 labels=None,
                 use_cache=False,
                 global_step=(1 << 62),
             ).logits
-            loss_sum = F.cross_entropy(
-                logits[:, :-1, :].contiguous().view(-1, logits.size(-1)),
-                labels[:, 1:].contiguous().view(-1),
-                ignore_index=-100,
-                reduction="sum",
-            )
-            count = (labels[:, 1:] != -100).sum()
 
-        total_loss += loss_sum
-        total_count += count
+            batch_mean = chunked_cross_entropy(
+                logits, labels, ignore_index=-100, chunk_tokens=8192
+            )
+            batch_valid = (labels[:, 1:] != -100).sum()
+
+        total_loss_sum += (batch_mean * batch_valid)
+        total_valid    += batch_valid
 
     if is_dist:
-        torch.distributed.all_reduce(total_loss, op=torch.distributed.ReduceOp.SUM)
-        torch.distributed.all_reduce(total_count, op=torch.distributed.ReduceOp.SUM)
+        dist.all_reduce(total_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_valid,    op=dist.ReduceOp.SUM)
 
-    mean_loss = (total_loss / torch.clamp(total_count, min=1)).item()
+    mean_loss = (total_loss_sum / torch.clamp(total_valid, min=1)).item()
     ppl = math.exp(mean_loss)
+
     model.train()
     return mean_loss, ppl
 
@@ -142,8 +122,15 @@ def compute_moe_stats(model, config, mode):
 
 def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_accum=1, continue_training=False):
     is_dist, rank, world_size, local_rank = init_distributed()
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
     def is_main(): return (not is_dist) or (rank == 0)
+
+    set_seed(42)
+    if is_main():
+        ensure_flash_attn()
+    if is_dist:
+        dist.barrier()
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     
     save_dir = f"/workspace/checkpoints/{mode}_exp1"
     os.makedirs(save_dir, exist_ok=True)
@@ -161,11 +148,6 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
         if is_main():
             print(f"🔹 Loading global hash table from: {HASH_TABLE_PATH}")
         freq_dict = {'__load_from_file__': HASH_TABLE_PATH}
-
-    if is_dist:
-        if rank == 0:
-            _ = load_or_prepare_pile(verbose=False)
-        dist.barrier()
 
     trainer_state = None
     if continue_training:
@@ -215,24 +197,50 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     train_dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
     valid_dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
 
-    NUM_WORKERS = max(1, os.cpu_count() // 2)
+    per_gpu_workers = max(2, (os.cpu_count() // (world_size if is_dist else 1)) // 2)
+    NUM_WORKERS = per_gpu_workers
+
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset) if is_dist else None
     valid_sampler = torch.utils.data.distributed.DistributedSampler(valid_dataset, shuffle=False) if is_dist else None
     
     train_generator = get_dataloader_generator(rank if is_dist else 0)
     valid_generator = get_dataloader_generator(rank if is_dist else 0)
     
+
+    from packaging import version
+    has_pin_dev = version.parse(torch.__version__) >= version.parse("1.12.1")
+    use_cuda = torch.cuda.is_available()
+    pin_kwargs = {}
+
+    if use_cuda:
+        pin_kwargs["pin_memory"] = True
+        if has_pin_dev:
+            pin_kwargs["pin_memory_device"] = f"cuda:{local_rank}"
+
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size,
-        shuffle=(train_sampler is None), sampler=train_sampler,
-        num_workers=NUM_WORKERS, pin_memory=True, prefetch_factor=2, persistent_workers=True,
-        worker_init_fn=worker_init_fn, generator=train_generator
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=NUM_WORKERS,
+        prefetch_factor=2,
+        persistent_workers=True,
+        worker_init_fn=worker_init_fn,
+        generator=train_generator,
+        **pin_kwargs,
     )
+
     valid_loader = DataLoader(
-        valid_dataset, batch_size=batch_size, shuffle=False,
-        sampler=valid_sampler, num_workers=NUM_WORKERS,
-        pin_memory=True, prefetch_factor=2, persistent_workers=True,
-        worker_init_fn=worker_init_fn, generator=valid_generator
+        valid_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        sampler=valid_sampler,
+        num_workers=NUM_WORKERS,
+        prefetch_factor=2,
+        persistent_workers=True,
+        worker_init_fn=worker_init_fn,
+        generator=valid_generator,
+        **pin_kwargs,
     )
 
     num_batches = len(train_loader)
@@ -258,8 +266,16 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
             broadcast_buffers=False,
             find_unused_parameters=False,
             static_graph=False,
+            bucket_cap_mb=100,
         )
     optimizer = get_default_optimizer(model)
+
+    if is_dist:
+        try:
+            from torch.distributed.algorithms.ddp_comm_hooks import default_hooks as dh
+            model.register_comm_hook(state=None, hook=dh.fp16_compress_hook)
+        except Exception:
+            pass
 
     runs_root = RUNS_DIR
     writer = None
@@ -333,23 +349,28 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
             train_sampler.set_epoch(epoch)
 
         for step, batch in enumerate(train_loader, start=1):
-            input_ids = batch["input_ids"].to(device)
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attn      = batch["attention_mask"].to(device, non_blocking=True)
+
             labels = input_ids.clone()
             labels[labels == enc.eot_token] = -100
 
             sync_now = (step % grad_accum) == 0
             ctx = (model.no_sync() if (is_dist and not sync_now) else contextlib.nullcontext())
+
             with ctx:
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     outputs = model(
                         input_ids=input_ids,
-                        attention_mask=batch["attention_mask"].to(device),
+                        attention_mask=attn,
                         labels=None,
                         use_cache=False,
                         global_step=step,
                     )
                     logits = outputs.logits
-                    main_loss = chunked_cross_entropy(logits, labels, ignore_index=-100, chunk_tokens=8192)
+                    main_loss = chunked_cross_entropy(
+                        logits, labels, ignore_index=-100, chunk_tokens=8192
+                    )
 
                 balance_losses = [m.last_balance_loss for m in model.modules()
                                   if isinstance(m, GPT2LayerMoE) and (m.last_balance_loss is not None)]
@@ -387,6 +408,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
 
                 if writer and (optim_step % 50 == 0):
                     writer.add_scalar("train/lr", scheduler.get_last_lr()[0], optim_step)
+                    writer.add_scalar("train/loss_total", float(loss.detach().item()), optim_step)
 
                 if (optim_step % five_percent_interval == 0) or (optim_step == point_one_step):
                     msg = ("🔍 Full validation (every 5%) at optim step "
@@ -395,7 +417,9 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
                     if progress_bar:
                         progress_bar.write(msg)
 
-                    valid_loss, valid_ppl = evaluate(model, valid_loader, device)
+                    valid_loss, valid_ppl = evaluate(model, valid_loader, device,
+                                 show_bar=True,
+                                 desc=f"Valid @ step {optim_step}")
                     stats = compute_moe_stats(base_model, config, mode) if (optim_step % five_percent_interval == 0) else {"balance": 0.0}
 
                     if is_main():
@@ -409,6 +433,12 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
                         if valid_loss < best_loss:
                             best_loss = valid_loss
                             save_checkpoint(base_model, optimizer, scheduler, optim_step, best_loss, total_train_steps, save_dir, "best_checkpoint.safetensors")
+
+                    if progress_bar:
+                        done = progress_bar.n
+                        progress_bar.reset(total=progress_bar.total)
+                        progress_bar.update(done)
+            
             if progress_bar:
                 progress_bar.update(1)
                 progress_bar.set_postfix(
