@@ -37,6 +37,52 @@ def get_default_scheduler(optimizer, total_steps, warmup_ratio=0.1):
         print(f"🗓️ Scheduler: cosine (warmup_ratio={warmup_ratio:.3f}, warmup_steps={warmup_steps}, total_steps={total_steps})")
     return scheduler
 
+def enable_sdp_backends():
+    import torch, os
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(False)
+    os.environ.setdefault("PYTORCH_CUDA_SDPA_ALLOW_FLASH_ATTENTION", "1")
+
+def prefer_flash_attention(model):
+    import warnings
+    try:
+        model.config.attn_implementation = "flash_attention_2"
+        return "flash_attention_2"
+    except Exception:
+        try:
+            model.config._attn_implementation = "flash_attention_2"
+            return "flash_attention_2"
+        except Exception:
+            pass
+
+    try:
+        model.config.attn_implementation = "sdpa"
+        return "sdpa"
+    except Exception:
+        try:
+            model.config._attn_implementation = "sdpa"
+            return "sdpa"
+        except Exception:
+            warnings.warn("Could not set attn_implementation; model may fall back to eager attention.")
+            return "unknown"
+
+def print_attn_stack_status(model, tag=""):
+    import torch
+    p = torch.cuda.get_device_properties(0)
+    try:
+        from transformers.utils import is_flash_attn_2_available
+        fa2_avail = is_flash_attn_2_available()
+    except Exception:
+        fa2_avail = "unknown"
+    print(f"[ATTN {tag}] device={p.name} sm={p.major}{p.minor}  torch={torch.__version__}  cuda={torch.version.cuda}")
+    print(f"[ATTN {tag}] flash_sdp={torch.backends.cuda.flash_sdp_enabled()} "
+          f"mem_efficient_sdp={torch.backends.cuda.mem_efficient_sdp_enabled()} "
+          f"math_sdp={torch.backends.cuda.math_sdp_enabled()}  fa2_avail={fa2_avail}")
+    impl = getattr(getattr(model, 'config', object()), 'attn_implementation',
+                   getattr(getattr(model, 'config', object()), '_attn_implementation', 'unset'))
+    print(f"[ATTN {tag}] model.config.attn_implementation={impl}")
+
 def save_checkpoint(model, optimizer, scheduler, step, best_loss, total_train_steps, path, name="checkpoint.safetensors"):
     if hasattr(model, "module"):
         model = model.module
