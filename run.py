@@ -201,7 +201,7 @@ def main():
 if __name__ == "__main__":
     main()
 
-#python run.py train --mode stablemoe --num_experts 16 --batch_size 44 --seq_len 1024 --grad_accum 1
+#python run.py train --mode dense --num_experts 16 --batch_size 2 --seq_len 1024 --grad_accum 1
 #torchrun --nproc_per_node=4 --master_port=29600 run.py train --mode ours_refine --num_experts 16 --batch_size 44 --seq_len 1024 --grad_accum 1
 #python run.py eval --batch_size 44 --num_experts 16
 

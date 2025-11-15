@@ -1,11 +1,10 @@
 #utils.py
 import os, math, random, numpy as np, torch
-from safetensors.torch import save_model
+from safetensors.torch import save_model, safe_open, load_file, save_file
 from transformers import get_cosine_schedule_with_warmup
 import torch.optim as optim
 import torch.nn.functional as F
 import re
-from safetensors.torch import safe_open
 
 def _is_rank0() -> bool:
     return os.environ.get("RANK", "0") == "0"
@@ -195,8 +194,19 @@ def print_attn_stack_status(model, tag=""):
 def save_checkpoint(model, optimizer, scheduler, step, best_loss, total_train_steps, path, name="checkpoint.safetensors"):
     if hasattr(model, "module"):
         model = model.module
+
     model_path = os.path.join(path, f"{name}")
-    save_model(model, model_path)
+
+    state_dict = model.state_dict()
+
+    if "transformer.wte.weight" not in state_dict and "lm_head.weight" in state_dict:
+        print("[save_checkpoint] transformer.wte.weight not found in state_dict – copying from lm_head.weight before saving.")
+        state_dict["transformer.wte.weight"] = state_dict["lm_head.weight"]
+
+    # safetensors로 직접 저장
+    save_file(state_dict, model_path)
+
+    # 트레이너 상태는 그대로
     trainer_state = {
         "step": int(step),
         "best_loss": float(best_loss),

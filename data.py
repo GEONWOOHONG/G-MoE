@@ -3,6 +3,13 @@ import os, random, numpy as np, torch
 from datasets import load_dataset
 from datasets.utils import logging as ds_logging
 
+from huggingface_hub import snapshot_download
+from glob import glob 
+from datasets import Features, Sequence, Value
+
+MAX_TRAIN_SHARDS = 10
+PILE_REPO_ID = "Geonwoohong/pile-uncopyrighted-train-tokenized-gpt2"
+
 def _is_rank0():
     return int(os.environ.get("RANK", "0")) == 0
 
@@ -22,11 +29,61 @@ def get_dataloader_generator(rank=0):
     return g
 
 def load_or_prepare_pile(cache_path=None, raw_cache=None, verbose=True):
-    cache_dir = os.environ.get("HF_DATASETS_CACHE", None)
-    if verbose:
-        print(f"🔹 Loading Geonwoohong/pile-uncopyrighted-train-tokenized-gpt2 (cache_dir={cache_dir})")
-    ds = load_dataset("Geonwoohong/pile-uncopyrighted-train-tokenized-gpt2", cache_dir=cache_dir)
-    return ds["train"], ds["validation"]
+    cache_dir_ds = os.environ.get("HF_DATASETS_CACHE", None)
+    cache_dir_hub = os.environ.get("HF_HOME", None) or cache_dir_ds
+
+    if MAX_TRAIN_SHARDS is None:
+        if verbose and _is_rank0():
+            print(f"🔹 Loading {PILE_REPO_ID} (cache_dir={cache_dir_ds}) [ALL shards]")
+        ds = load_dataset(PILE_REPO_ID, cache_dir=cache_dir_ds)
+        return ds["train"], ds["validation"]
+
+    if verbose and _is_rank0():
+        print(
+            f"🔹 Downloading first {MAX_TRAIN_SHARDS} train shards "
+            f"from {PILE_REPO_ID} (cache_dir={cache_dir_hub})"
+        )
+
+    allow_patterns = [
+        *(f"train/train.{i:05d}.parquet" for i in range(MAX_TRAIN_SHARDS)),
+        "validation/*.parquet",
+    ]
+
+    repo_path = snapshot_download(
+        repo_id=PILE_REPO_ID,
+        repo_type="dataset",
+        cache_dir=cache_dir_hub,
+        allow_patterns=allow_patterns,
+    )
+
+    train_files = [
+        os.path.join(repo_path, f"train/train.{i:05d}.parquet")
+        for i in range(MAX_TRAIN_SHARDS)
+    ]
+    valid_files = sorted(glob(os.path.join(repo_path, "validation", "*.parquet")))
+
+    if verbose and _is_rank0():
+        print(f"  ├─ train shards: {len(train_files)} -> {train_files[0]} ...")
+        print(f"  └─ validation files: {len(valid_files)}")
+
+    features = Features({
+        "input_ids": Sequence(Value("int32"), length=1024),
+        "attention_mask": Sequence(Value("int8"), length=1024),
+    })
+
+    train_ds = load_dataset(
+        "parquet",
+        data_files={"train": train_files},
+        features=features,
+    )["train"]
+
+    valid_ds = load_dataset(
+        "parquet",
+        data_files={"validation": valid_files},
+        features=features,
+    )["validation"]
+
+    return train_ds, valid_ds
 
 def load_pile_test(verbose=True):
     cache_dir = os.environ.get("HF_DATASETS_CACHE", None)

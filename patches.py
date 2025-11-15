@@ -3,6 +3,7 @@ import os, torch, types
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from transformers import GPT2LMHeadModel
 from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions
+from modeling import GPT2LayerMoE
 
 def patch_model_for_ours_refine(model):
     rank = int(os.environ.get("RANK", "0"))
@@ -89,12 +90,15 @@ def block_moe_forward_patch(
     residual = hidden_states
     normed = self.ln_2(hidden_states)
 
-    mlp_result = self.mlp(
-        normed,
-        input_ids=input_ids,
-        routing_state=routing_state,
-        global_step=global_step,
-    )
+    if isinstance(self.mlp, GPT2LayerMoE):
+        mlp_result = self.mlp(
+            normed,
+            input_ids=input_ids,
+            routing_state=routing_state,
+            global_step=global_step,
+        )
+    else:
+        mlp_result = self.mlp(normed)
 
     if isinstance(mlp_result, tuple):
         out, balance_loss, updated_routing_state = mlp_result
