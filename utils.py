@@ -203,10 +203,12 @@ def save_checkpoint(model, optimizer, scheduler, step, best_loss, total_train_st
         print("[save_checkpoint] transformer.wte.weight not found in state_dict – copying from lm_head.weight before saving.")
         state_dict["transformer.wte.weight"] = state_dict["lm_head.weight"]
 
-    # safetensors로 직접 저장
+    if "transformer.wte.weight" in state_dict and "lm_head.weight" in state_dict:
+        print("[save_checkpoint] Detaching shared lm_head.weight from transformer.wte.weight for saving.")
+        state_dict["lm_head.weight"] = state_dict["lm_head.weight"].clone()
+
     save_file(state_dict, model_path)
 
-    # 트레이너 상태는 그대로
     trainer_state = {
         "step": int(step),
         "best_loss": float(best_loss),
