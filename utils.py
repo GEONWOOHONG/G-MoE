@@ -258,34 +258,52 @@ def print_model_info(model, config, mode, num_experts,
     print("=====================================")
 
 def ensure_flash_attn():
-    import importlib.util, subprocess, sys
-    try:
-        spec = importlib.util.find_spec("flash_attn")
-        if spec is None:
-            if _is_rank0():
-                print("🔹 Installing FlashAttention (flash-attn==2.7.4.post1)...")
+    import importlib.util, subprocess, sys, platform, torch
+
+    spec = importlib.util.find_spec("flash_attn")
+    if spec is not None:
+        print("✅ FlashAttention already installed.")
+        return
+
+    is_windows = platform.system().lower() == "windows"
+
+    if not is_windows:
+        print("🔹 Linux detected — installing FlashAttention via pip (upstream).")
+        try:
             subprocess.check_call([
                 sys.executable, "-m", "pip", "install",
-                "flash-attn==2.7.4.post1", "--no-build-isolation"
+                "flash-attn==2.8.3", "--no-build-isolation"
             ])
-            if _is_rank0():
-                try:
-                    import flash_attn as _fa
-                    ver = getattr(_fa, "__version__", "unknown")
-                    print(f"✅ FlashAttention installed: {ver}")
-                except Exception:
-                    print("✅ FlashAttention installed.")
-        else:
-            if _is_rank0():
-                try:
-                    import flash_attn as _fa
-                    ver = getattr(_fa, "__version__", "unknown")
-                    print(f"✅ FlashAttention found: {ver}")
-                except Exception:
-                    print("✅ FlashAttention found.")
+            print("✅ FlashAttention installed (Linux).")
+        except Exception as e:
+            print("⚠️ FlashAttention install failed (Linux):", e)
+        return
+
+    print("🔹 Windows detected — using unofficial flash-attn wheels")
+
+    torch_version = torch.__version__.split("+")[0]
+    cuda_version = torch.version.cuda.replace(".", "")
+    py_ver = f"cp{sys.version_info.major}{sys.version_info.minor}"
+
+    wheel_filename = f"flash_attn-2.8.3+cu{cuda_version}torch{torch_version}cxx11abiFALSE-{py_ver}-{py_ver}-win_amd64.whl"
+
+    wheel_url = (
+        "https://github.com/kingbri1/flash-attention/releases/download/"
+        f"v2.8.3/{wheel_filename}"
+    )
+
+    print("📦 Attempting to install:")
+    print("   Wheel :", wheel_filename)
+    print("   URL   :", wheel_url)
+
+    try:
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", wheel_url
+        ])
+        print("✅ FlashAttention installed (Windows unofficial wheel).")
     except Exception as e:
-        if _is_rank0():
-            print("⚠️ FlashAttention install failed:", e)
+        print("⚠️ FlashAttention install failed on Windows:", e)
+        print("➡ Falling back to SDPA / Eager attention.")
 
 def get_default_optimizer(model):
     params = (p for p in model.parameters() if p.requires_grad)
