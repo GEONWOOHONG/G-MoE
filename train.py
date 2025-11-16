@@ -298,7 +298,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
         if mode in ("ours_com", "ours_refine"):
             print(f"🔎 Experts: globals={num_experts}, local_per_layer=1, total_passed={eff_num_experts}")
 
-    if is_main() and not os.path.exists(os.path.join(save_dir, "config.json")):
+    if is_main():
         config.loss_type = "ForCausalLMLoss"
         config.save_pretrained(save_dir)
 
