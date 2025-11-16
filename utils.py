@@ -191,34 +191,40 @@ def print_attn_stack_status(model, tag=""):
                    getattr(getattr(model, 'config', object()), '_attn_implementation', 'unset'))
     print(f"[ATTN {tag}] model.config.attn_implementation={impl}")
 
-def save_checkpoint(model, optimizer, scheduler, step, best_loss, total_train_steps, path, name="checkpoint.safetensors"):
-    if hasattr(model, "module"):
-        model = model.module
-
-    model_path = os.path.join(path, f"{name}")
+@torch.no_grad()
+def save_checkpoint(model, optimizer, scheduler, step, best_loss, total_steps, save_dir, filename):
+    os.makedirs(save_dir, exist_ok=True)
+    model_path = os.path.join(save_dir, filename)
 
     state_dict = model.state_dict()
 
-    if "transformer.wte.weight" not in state_dict and "lm_head.weight" in state_dict:
-        print("[save_checkpoint] transformer.wte.weight not found in state_dict – copying from lm_head.weight before saving.")
-        state_dict["transformer.wte.weight"] = state_dict["lm_head.weight"]
+    cloned_sd = {}
+    for k, v in state_dict.items():
+        if (
+            "global_experts" in k
+            or "shared_router" in k
+        ):
+            cloned_sd[k] = v.clone().detach()
+        else:
+            cloned_sd[k] = v
 
-    if "transformer.wte.weight" in state_dict and "lm_head.weight" in state_dict:
-        print("[save_checkpoint] Detaching shared lm_head.weight from transformer.wte.weight for saving.")
-        state_dict["lm_head.weight"] = state_dict["lm_head.weight"].clone()
+    if "lm_head.weight" in cloned_sd and "transformer.wte.weight" in cloned_sd:
+        cloned_sd["lm_head.weight"] = cloned_sd["lm_head.weight"].clone().detach()
 
-    save_file(state_dict, model_path)
-
-    trainer_state = {
-        "step": int(step),
-        "best_loss": float(best_loss),
-        "total_train_steps": int(total_train_steps),
+    ckpt = {
+        "model": cloned_sd,
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
+        "step": step,
+        "best_loss": best_loss,
+        "total_steps": total_steps,
     }
-    trainer_path = os.path.join(path, f"{name}_trainer.pt")
-    torch.save(trainer_state, trainer_path)
-    print(f"🔹 Checkpoint saved: {model_path}, {trainer_path}")
+
+    from safetensors.torch import save_file
+    save_file(ckpt["model"], model_path)
+
+    if _is_rank0():
+        print(f"[save_checkpoint] Saved to: {model_path}")
 
 def print_model_info(model, config, mode, num_experts,
                      batch_size=None, grad_accum_steps=None, effective_batch=None):
