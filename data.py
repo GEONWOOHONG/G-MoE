@@ -74,14 +74,6 @@ def load_or_prepare_pile(cache_path=None, raw_cache=None, verbose=True):
         data_files={"validation": valid_files},
     )["validation"]
 
-    features = Features({
-        "input_ids": Sequence(Value("int32"), length=1024),
-        "attention_mask": Sequence(Value("int8"), length=1024),
-    })
-
-    train_ds = train_ds.cast(features)
-    valid_ds = valid_ds.cast(features)
-
     return train_ds, valid_ds
 
 def load_pile_test(verbose=True):
