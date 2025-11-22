@@ -239,7 +239,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     logical_cpus = os.cpu_count() or 2
     gpus = (world_size if is_dist else 1)
     computed = max(2, (logical_cpus // gpus) // 2)
-    NUM_WORKERS = min(16, computed)
+    NUM_WORKERS = 8
 
     if is_main():
         print(f"🧵 DataLoader workers per GPU: computed={computed} → using={NUM_WORKERS}")

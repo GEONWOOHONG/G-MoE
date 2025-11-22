@@ -7,7 +7,7 @@ from huggingface_hub import snapshot_download
 from glob import glob 
 from datasets import Features, Sequence, Value
 
-MAX_TRAIN_SHARDS = 10
+MAX_TRAIN_SHARDS = 5
 PILE_REPO_ID = "Geonwoohong/pile-uncopyrighted-train-tokenized-gpt2"
 
 def _is_rank0():
