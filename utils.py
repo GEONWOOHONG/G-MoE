@@ -278,7 +278,7 @@ def ensure_flash_attn():
         try:
             subprocess.check_call([
                 sys.executable, "-m", "pip", "install",
-                "flash-attn==2.8.3", "--no-build-isolation"
+                "flash-attn", "--no-build-isolation"
             ])
             print("✅ FlashAttention installed (Linux).")
         except Exception as e:
