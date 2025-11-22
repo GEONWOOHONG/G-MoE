@@ -707,6 +707,7 @@ class MoELayer(nn.Module):
             global_out = out_flat.view_as(x)
 
             aux_loss = None
+            # loss ablation
             if self.training and getattr(self, "aux_alpha", 0.01) > 0.0:
                 one_hot = torch.nn.functional.one_hot(top_idx_flat, num_classes=self.num_experts).float()
                 freq = one_hot.mean(0)
@@ -730,7 +731,9 @@ class MoELayer(nn.Module):
             if probe is not None:
                 aux_loss = (aux_loss if aux_loss is not None else 0.0) + probe
 
+            #detach
             updated_routing_state = {"h": h_new, "logits": logits.detach()}
+            # updated_routing_state = {"h": h_new, "logits": logits}
 
             return routed_out, aux_loss, updated_routing_state
 
@@ -1143,7 +1146,19 @@ def convert_gpt2_to_moe(
         hypermoe_shared_pack = HyperMoEShared(defaults, d_model, num_experts)
         model.hypermoe_shared = hypermoe_shared_pack
 
+    n_layers = len(model.transformer.h)
+    if mode in ("ours_com", "ours_refine"):
+        moe_layer_indices = set(range(n_layers))
+    else:
+        moe_stride = 2
+        moe_layer_indices = set(range(0, n_layers, moe_stride))
+    if _rank0():
+        print(f"🔹 MoE layers for mode={mode}: {sorted(moe_layer_indices)}")
+
     for i, block in enumerate(model.transformer.h):
+        if i not in moe_layer_indices:
+            continue
+
         if mode == "ours_com":
             block.mlp = GPT2LayerMoE(
                 config, mode, layer_experts,
@@ -1155,6 +1170,7 @@ def convert_gpt2_to_moe(
                 shared_router=shared_router,
                 layer_idx=i,
             )
+
         elif mode == "ours_refine":
             block.mlp = GPT2LayerMoE(
                 config, mode, layer_experts,
@@ -1166,6 +1182,7 @@ def convert_gpt2_to_moe(
                 shared_router=shared_router,
                 layer_idx=i,
             )
+
         elif mode == "hypermoe":
             hypermoe_defaults = dict(
                 k=1,
@@ -1193,6 +1210,7 @@ def convert_gpt2_to_moe(
                 layer_idx=i,
             )
             block.mlp = layer
+
         else:
             layer = GPT2LayerMoE(
                 config, mode, layer_experts,
@@ -1213,4 +1231,5 @@ def convert_gpt2_to_moe(
                 import weakref
                 object.__setattr__(layer.moe, "_stable_root_ref", weakref.ref(model))
             block.mlp = layer
+
     return model

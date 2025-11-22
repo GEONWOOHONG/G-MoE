@@ -188,9 +188,9 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
             vocab_size=vocab_size,
             n_positions=1024,
             n_ctx=1024,
-            n_embd=1024,
-            n_layer=8,
-            n_head=8
+            n_embd=768,
+            n_layer=12,
+            n_head=12,
         )
         model = GPT2LMHeadModel(config)
         stable_args = dict(stable_routing_dim=50, stable_balance_alpha=0.3)
@@ -225,7 +225,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
     else:
         train_dataset, valid_dataset = load_or_prepare_pile(verbose=is_main())
 
-    valid_dataset = valid_dataset.select(range(int(0.1 * len(valid_dataset))))
+    valid_dataset = valid_dataset.select(range(int(0.01  * len(valid_dataset))))
     
     if is_main():
         print(f"Using FULL datasets: train={len(train_dataset):,}, valid={len(valid_dataset):,}")
