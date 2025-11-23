@@ -205,7 +205,7 @@ if __name__ == "__main__":
     main()
 
 #python run.py train --mode ours_refine --num_experts 4 --batch_size 4 --seq_len 1024 --grad_accum 2
-#torchrun --nproc_per_node=8 --master_port=29600 run.py train --mode switch --num_experts 16 --batch_size 64 --seq_len 1024 --grad_accum 1
+#torchrun --nproc_per_node=8 --master_port=29600 run.py train --mode ours_refine --num_experts 16 --batch_size 64 --seq_len 1024 --grad_accum 1
 #python run.py eval --batch_size 44 --num_experts 16
 
 # Full analysis (all modes, all metrics):
@@ -222,7 +222,7 @@ if __name__ == "__main__":
 #python run.py analysis --skip_specialization --modes ours_refine  # only layer
 
 #apt update && apt install -y nano zip unzip && pip install transformers datasets tensorboard pandas tqdm scipy tiktoken safetensors huggingface_hub hf_transfer calflops
-#tensorboard --logdir=../workspace/runs --host=0.0.0.0 --port=6006
+#tensorboard --logdir=.//runs --host=0.0.0.0 --port=6006
 
 #wget https://github.com/schollz/croc/releases/download/v10.2.5/croc_v10.2.5_Linux-64bit.tar.gz
 #tar xzf croc_v10.2.5_Linux-64bit.tar.gz
