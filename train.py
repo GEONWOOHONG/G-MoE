@@ -22,7 +22,7 @@ from utils import (
     enable_sdp_backends, prefer_flash_attention, print_attn_stack_status,
 )
 
-from config import RUNS_DIR, get_hash_table_path
+from config import get_hash_table_path
 from tools_hash import create_global_hash_table
 from data import load_or_prepare_pile, worker_init_fn, get_dataloader_generator, load_or_prepare_mt
 from modeling import convert_gpt2_to_moe, GPT2LayerMoE
@@ -327,12 +327,11 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
         except Exception:
             pass
 
-    runs_root = RUNS_DIR
     writer = None
     if is_main():
-        if os.path.exists(runs_root):
-            shutil.rmtree(runs_root)
-        writer = SummaryWriter(log_dir=os.path.join(runs_root, "exp1"))
+        runs_root = os.path.join(save_dir, "runs")
+        os.makedirs(runs_root, exist_ok=True)
+        writer = SummaryWriter(log_dir=runs_root)
 
     if continue_training and trainer_state is not None:
         optimizer.load_state_dict(trainer_state["optimizer"])
