@@ -171,18 +171,18 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
 
     trainer_state = None
     if continue_training:
-        print("🔄 Loading model from last checkpoint...")
+        print("🔄 Loading model from BEST checkpoint...")
         config = GPT2Config.from_pretrained(save_dir)
         model = GPT2LMHeadModel(config)
         model = convert_gpt2_to_moe(
             model, config, mode=mode, num_experts=eff_num_experts, alpha=0.01, freq_dict=freq_dict
         )
-        last_ckpt = os.path.join(save_dir, "last_checkpoint.safetensors")
-        trainer_path = os.path.join(save_dir, "last_checkpoint.safetensors_trainer.pt")
-        if not (os.path.exists(last_ckpt) and os.path.exists(trainer_path)):
+        best_ckpt = os.path.join(save_dir, "best_checkpoint.safetensors")
+        trainer_path = os.path.join(save_dir, "best_checkpoint_trainer.pt")
+        if not (os.path.exists(best_ckpt) and os.path.exists(trainer_path)):
             raise FileNotFoundError("Checkpoint files not found for continuation.")
-        load_model(model, last_ckpt)
-        print(f"🔹 Loaded model weights from: {last_ckpt}")
+        load_model(model, best_ckpt)
+        print(f"🔹 Loaded model weights from: {best_ckpt}")
         trainer_state = torch.load(trainer_path, map_location="cpu")
         print(f"🔹 Restoring optimizer/scheduler from {trainer_path}")
     else:
@@ -416,7 +416,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
                         attention_mask=attn,
                         labels=None,
                         use_cache=False,
-                        global_step=step,
+                        global_step=optim_step,
                     )
                     logits = outputs.logits
                     main_loss = chunked_cross_entropy(
@@ -474,15 +474,32 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
 
                     if is_main():
                         if optim_step % five_percent_interval == 0:
-                            print(f"[OptStep {optim_step}] Valid Loss {valid_loss:.4f}, PPL {valid_ppl:.2f}, Balance {stats['balance']:.4f}")
+                            print(f"[OptStep {optim_step}] Valid loss {valid_loss:.4f}, PPL {valid_ppl:.2f}, Balance {stats['balance']:.4f}")
                             if writer:
                                 writer.add_scalar("valid/balance", stats["balance"], optim_step)
                         if writer:
                             writer.add_scalar("valid/loss", valid_loss, optim_step)
                             writer.add_scalar("valid/ppl", valid_ppl, optim_step)
+
                         if valid_loss < best_loss:
                             best_loss = valid_loss
-                            save_checkpoint(base_model, optimizer, scheduler, optim_step, best_loss, total_train_steps, save_dir, "best_checkpoint.safetensors")
+                            save_checkpoint(
+                                base_model, optimizer, scheduler,
+                                optim_step, best_loss, total_train_steps,
+                                save_dir, "best_checkpoint.safetensors",
+                            )
+
+                            trainer_state_to_save = {
+                                "optimizer": optimizer.state_dict(),
+                                "scheduler": scheduler.state_dict(),
+                                "step": optim_step,
+                                "best_loss": best_loss,
+                                "total_train_steps": total_train_steps,
+                            }
+                            torch.save(
+                                trainer_state_to_save,
+                                os.path.join(save_dir, "best_checkpoint_trainer.pt"),
+                            )
 
                     if progress_bar:
                         done = progress_bar.n
