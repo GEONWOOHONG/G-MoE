@@ -123,7 +123,12 @@ def compute_moe_stats(model, config, mode):
             balance_scores.append(entropy)
     return {"balance": sum(balance_scores) / len(balance_scores) if balance_scores else 0.0}
 
-def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_accum=1, continue_training=False, mt=False):
+def train_moe(
+    mode="switch", num_experts=8,
+    batch_size=32, seq_len=1024, grad_accum=1,
+    continue_training=False, mt=False,
+    ablate_local: bool = False,
+):
     is_dist, rank, world_size, local_rank = init_distributed()
 
     def is_main():
@@ -175,7 +180,12 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
         config = GPT2Config.from_pretrained(save_dir)
         model = GPT2LMHeadModel(config)
         model = convert_gpt2_to_moe(
-            model, config, mode=mode, num_experts=eff_num_experts, alpha=0.01, freq_dict=freq_dict
+            model, config,
+            mode=mode,
+            num_experts=eff_num_experts,
+            alpha=0.01,
+            freq_dict=freq_dict,
+            ablate_local=ablate_local,
         )
         best_ckpt = os.path.join(save_dir, "best_checkpoint.safetensors")
         trainer_path = os.path.join(save_dir, "best_checkpoint_trainer.pt")
@@ -204,6 +214,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
             num_experts=eff_num_experts,
             alpha=0.01,
             freq_dict=freq_dict,
+            ablate_local=ablate_local,
             **(stable_args if mode == "stablemoe" else {})
         )
 
@@ -303,6 +314,7 @@ def train_moe(mode="switch", num_experts=8, batch_size=32, seq_len=1024, grad_ac
 
     if is_main():
         config.loss_type = "ForCausalLMLoss"
+        config.ablate_local = bool(ablate_local)
         config.save_pretrained(save_dir)
 
     model.to(device)

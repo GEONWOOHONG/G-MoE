@@ -341,6 +341,7 @@ class MoELayer(nn.Module):
                  xmoe_threshold: float = 0.90,
                  xmoe_capacity_factor: float = 1.0,
                  xmoe_expert_mult: float = 0.25,
+                 ablate_local=False,
                  vocab_size: int = 50257):
         super().__init__()
         self.vocab_size = int(vocab_size) 
@@ -353,6 +354,7 @@ class MoELayer(nn.Module):
         self.last_scores = None
         self.aux_alpha = alpha
         self.last_aux = {"balance": None, "distill": None, "overflow_rate": None}
+        self.ablate_local = ablate_local
 
         if mode == "xmoe":
             d_ff_expert = max(64, int(d_model * 4 * xmoe_expert_mult))
@@ -677,6 +679,67 @@ class MoELayer(nn.Module):
             h_new = self.shared_router(x, h_prev=(routing_state["h"] if isinstance(routing_state, dict) else routing_state))
             h_feat = self.h_ln(h_new)
 
+            if getattr(self, "ablate_local", False):
+                N = h_feat.size(0)
+
+                if isinstance(routing_state, dict) and ("logits" in routing_state) and (routing_state["logits"] is not None):
+                    prev_logits = routing_state["logits"].to(h_feat.dtype)
+                else:
+                    prev_logits = h_feat.new_zeros((N, self.score_dim))
+
+                prev_feat = self.prev_score_proj(self.prev_score_ln(prev_logits))
+                gate_in = torch.cat([h_feat, prev_feat], dim=-1)
+
+                logits = self.gate_head(gate_in)
+                scores = F.softmax(logits, dim=-1)
+                self.last_scores = scores.detach()
+
+                top_scores, top_idx = torch.topk(scores, k=2, dim=-1)
+
+                B, T, H = x.shape
+                x_flat = x.view(-1, H)
+                out_flat = torch.zeros_like(x_flat)
+
+                capacity = int(self.capacity_factor * math.ceil(x_flat.size(0) * 2 / self.num_experts))
+                if (not self.training) and (not STRICT_CAPACITY_IN_EVAL):
+                    capacity = x_flat.size(0)
+
+                for r in range(2):
+                    idx_e = top_idx[:, r]
+                    score_e = top_scores[:, r]
+
+                    for eid in range(len(self.global_experts)):
+                        tok = (idx_e == eid).nonzero(as_tuple=True)[0]
+                        if tok.numel() == 0:
+                            continue
+
+                        tok_keep = tok[:capacity]
+                        dropped = tok[capacity:]
+
+                        if tok_keep.numel() > 0:
+                            y = self.global_experts[eid](x_flat[tok_keep]) * score_e[tok_keep].unsqueeze(-1)
+                            out_flat[tok_keep] += y.to(out_flat.dtype)
+
+                        if dropped.numel() > 0:
+                            if ZERO_OUT_DROPPED:
+                                out_flat[dropped].zero_()
+                            else:
+                                out_flat[dropped] = x_flat[dropped]
+
+                routed_out = out_flat.view(B, T, H)
+
+                aux_loss = None
+                if self.training and getattr(self, "aux_alpha", 0.01) > 0.0:
+                    one_hot = torch.nn.functional.one_hot(top_idx.view(-1), num_classes=self.num_experts).float()
+                    freq = one_hot.mean(0)
+                    Pi   = scores.mean(0)
+                    fi   = freq * self.num_experts
+                    aux_loss = (Pi * fi).sum() * self.aux_alpha
+
+                updated_routing_state = {"h": h_new, "logits": logits.detach()}
+
+                return routed_out, aux_loss, updated_routing_state
+
             N = h_feat.size(0)
             if isinstance(routing_state, dict) and ("logits" in routing_state) and (routing_state["logits"] is not None):
                 prev_logits = routing_state["logits"]
@@ -693,7 +756,7 @@ class MoELayer(nn.Module):
 
             B, T, H = x.shape
             local_out = self.experts[0](x)
-    
+
             top_scores, top_idx = torch.topk(scores, k=1, dim=-1)
             x_flat = x.view(-1, H)
             out_flat = torch.zeros_like(x_flat)
@@ -707,7 +770,6 @@ class MoELayer(nn.Module):
             global_out = out_flat.view_as(x)
 
             aux_loss = None
-            # loss ablation
             if self.training and getattr(self, "aux_alpha", 0.01) > 0.0:
                 one_hot = torch.nn.functional.one_hot(top_idx_flat, num_classes=self.num_experts).float()
                 freq = one_hot.mean(0)
@@ -731,10 +793,7 @@ class MoELayer(nn.Module):
             if probe is not None:
                 aux_loss = (aux_loss if aux_loss is not None else 0.0) + probe
 
-            #detach
             updated_routing_state = {"h": h_new, "logits": logits.detach()}
-            # updated_routing_state = {"h": h_new, "logits": logits}
-
             return routed_out, aux_loss, updated_routing_state
 
         elif self.mode == "hash":
@@ -951,7 +1010,8 @@ class GPT2LayerMoE(nn.Module):
                  xmoe_threshold: float = 0.90,
                  xmoe_capacity_factor: float = 1.0,
                  xmoe_expert_mult: float = 0.25,
-                 hypermoe_kwargs: dict | None = None):
+                 hypermoe_kwargs: dict | None = None,
+                 ablate_local: bool = False):
         super().__init__()
         self.mode = mode
         self.moe = MoELayer(
@@ -969,6 +1029,7 @@ class GPT2LayerMoE(nn.Module):
             xmoe_capacity_factor=xmoe_capacity_factor,
             xmoe_expert_mult=xmoe_expert_mult,
             vocab_size=getattr(config, "vocab_size", 50257),
+            ablate_local=ablate_local,
         )
         self.layer_idx = 0 if layer_idx is None else int(layer_idx)
         setattr(self.moe, "_layer_idx", self.layer_idx)
@@ -1055,18 +1116,17 @@ class HashRouter:
         return self.table_tensor[token_ids]
 
 def convert_gpt2_to_moe(
-    model,
-    config,
-    mode: str = "switch",
-    num_experts: int = 8,
-    alpha: float = 0.01,
-    capacity_factor: float = 1.25,
+    model, config,
+    mode, num_experts,
+    alpha=0.01,
+    capacity_factor=1.25,
     freq_dict=None,
-    xmoe_threshold: float = 0.90,
-    xmoe_capacity_factor: float | None = None,
-    xmoe_expert_mult: float = 0.25,
-    stable_routing_dim: int = 50,
-    stable_balance_alpha: float = 0.3,
+    ablate_local: bool = False,
+    xmoe_threshold=0.90,
+    xmoe_capacity_factor=1.0,
+    xmoe_expert_mult=0.25,
+    stable_routing_dim=50,
+    stable_balance_alpha=0.3,
 ):
     if mode == "dense":
         if _rank0():
@@ -1181,6 +1241,7 @@ def convert_gpt2_to_moe(
                 freq_dict=None,
                 shared_router=shared_router,
                 layer_idx=i,
+                ablate_local=ablate_local,
             )
 
         elif mode == "hypermoe":

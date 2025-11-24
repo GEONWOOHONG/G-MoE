@@ -136,7 +136,7 @@ def measure_decode_throughput(model, prompt_ids, gen_len=50, dtype=torch.bfloat1
         "Decode_gen": int(gen_len)
     }
 
-def run_all_tests(batch_size=44, base_num_experts=16):
+def run_all_tests(batch_size=44, base_num_experts=16, ablate_local: bool = False):
     set_seed(42)
     if torch.cuda.is_available():
         ensure_flash_attn()
@@ -235,6 +235,7 @@ def run_all_tests(batch_size=44, base_num_experts=16):
                     vocab_size=50257, n_positions=1024, n_ctx=1024,
                     n_embd=1024, n_layer=8, n_head=8
                 )
+            cfg_ablate = bool(getattr(config, "ablate_local", False))
 
             model = GPT2LMHeadModel(config)
 
@@ -258,9 +259,13 @@ def run_all_tests(batch_size=44, base_num_experts=16):
                 if mode == "stablemoe":
                     extra.update(dict(stable_routing_dim=50, stable_balance_alpha=0.3))
 
+                use_ablate = cfg_ablate or (ablate_local and mode == "ours_refine")
+                
                 model = convert_gpt2_to_moe(
                     model, config, mode=mode,
-                    num_experts=eff_num_experts, alpha=0.01, **extra
+                    num_experts=eff_num_experts, alpha=0.01,
+                    ablate_local=use_ablate,
+                    **extra,
                 )
 
             if mode == "hash":
