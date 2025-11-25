@@ -755,6 +755,22 @@ class MoELayer(nn.Module):
                     fi = freq * self.num_experts
                     aux_loss = (Pi * fi).sum() * self.aux_alpha
 
+                alpha = getattr(self, "ddp_probe_alpha", 1e-8)
+                probe = self._ddp_probe_loss(dtype=x.dtype, device=x.device, alpha=alpha)
+
+                if hasattr(self, "global_experts") and self.global_experts is not None:
+                    d = self.d_model
+                    p = torch.randn(8, d, device=x.device, dtype=x.dtype) * 1e-3
+                    g_loss = None
+                    for e in self.global_experts:
+                        y = e(p); l = (y**2).mean()
+                        g_loss = l if g_loss is None else (g_loss + l)
+                    if g_loss is not None:
+                        probe = (probe if probe is not None else 0.0) + alpha * g_loss
+
+                if probe is not None:
+                    aux_loss = (aux_loss if aux_loss is not None else 0.0) + probe
+
                 updated_routing_state = {"h": h_new, "logits": logits.detach()}
 
                 return routed_out, aux_loss, updated_routing_state
