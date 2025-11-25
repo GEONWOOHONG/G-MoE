@@ -697,7 +697,8 @@ class MoELayer(nn.Module):
                 h_prev = None
 
             h_new = self.shared_router(x, h_prev=h_prev)
-            h_feat = h_new.view(-1, h_new.size(-1))
+            h_norm = self.h_ln(h_new)
+            h_feat = h_norm.view(-1, h_norm.size(-1))
 
             if getattr(self, "ablate_local", False):
                 N = h_feat.size(0)
