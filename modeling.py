@@ -721,7 +721,6 @@ class MoELayer(nn.Module):
                 top_prob, top_idx = torch.topk(scores, k=topk, dim=-1)
 
                 cap = int(self.capacity_factor * (x_flat.size(0) / self.num_experts))
-                ZERO_OUT_DROPPED = True
                 out_flat = torch.zeros_like(x_flat)
 
                 top_idx_tok  = top_idx.view(-1, topk)
