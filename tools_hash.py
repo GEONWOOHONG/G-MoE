@@ -20,38 +20,35 @@ def create_global_hash_table(num_experts, vocab_size=50257, save_path=None, mt=F
     print(f"📊 Using the FULL train dataset of {len(sample_dataset):,} documents.")
 
     def count_tokens_in_batch(batch):
-        tokens_list = []
-        counts_list = []
+        batch_counter = Counter()
         for ids in batch["input_ids"]:
-            c = Counter(ids)
-            tokens_list.append(list(c.keys()))
-            counts_list.append(list(c.values()))
-        return {"tokens": tokens_list, "counts": counts_list}
+            batch_counter.update(ids)
+        return {"tokens": [list(batch_counter.keys())], "counts": [list(batch_counter.values())]}
 
-    num_procs = os.cpu_count() // 2
+    num_procs = max(1, os.cpu_count() // 2)
     print(f"🔄 Processing batches in parallel using {num_procs} processes...")
+    
     result_counters = sample_dataset.map(
         count_tokens_in_batch,
         batched=True,
-        batch_size=10000,
+        batch_size=10000, 
         num_proc=num_procs,
         remove_columns=sample_dataset.column_names
     )
 
-    print("🔄 Merging results from all processes...")
+    print(f"🔄 Merging results from all processes... (Reduced rows: {len(result_counters)})")
     total_counter = Counter()
-    iterable_results = result_counters.to_iterable_dataset()
-
-    for item in tqdm(iterable_results, desc="Merging Counters", total=len(result_counters)):
-        if isinstance(item['tokens'][0], list):
-            tokens = item['tokens'][0]
-            counts = item['counts'][0]
-        else:
-            tokens = item['tokens']
-            counts = item['counts']
-        if tokens and isinstance(tokens, list):
-            batch_dict = dict(zip(tokens, counts))
-            total_counter.update(batch_dict)
+    
+    for item in tqdm(result_counters, desc="Merging Counters"):
+        tokens = item['tokens']
+        counts = item['counts']
+        
+        if tokens and isinstance(tokens[0], list):
+             tokens = tokens[0]
+             counts = counts[0]
+             
+        batch_dict = dict(zip(tokens, counts))
+        total_counter.update(batch_dict)
 
     freq_dict_data = total_counter
     print("🛠️ Creating balanced assignment table...")
