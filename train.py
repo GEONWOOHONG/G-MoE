@@ -202,14 +202,22 @@ def train_moe(
     freq_dict = None
     if mode == "hash":
         hash_path = get_hash_table_path(vocab_size)
-        if not os.path.exists(hash_path):
-            if is_main():
-                print(f"⚠️  Hash table not found at {hash_path}. Auto-building now.")
-                create_global_hash_table(num_experts, vocab_size=vocab_size, save_path=hash_path, mt=mt)
-            if is_dist:
-                dist.barrier()
+
+        if is_main() and (not os.path.exists(hash_path)):
+            print(f"⚠️  Hash table not found at {hash_path}. Auto-building now.")
+            create_global_hash_table(
+                num_experts,
+                vocab_size=vocab_size,
+                save_path=hash_path,
+                mt=mt
+            )
+
+        if is_dist:
+            dist.barrier()
+
         if is_main():
             print(f"🔹 Loading global hash table from: {hash_path}")
+
         freq_dict = {'__load_from_file__': hash_path}
 
     trainer_state = None
