@@ -33,7 +33,7 @@ def create_global_hash_table(num_experts, vocab_size=50257, save_path=None, mt=F
     result_counters = sample_dataset.map(
         count_tokens_in_batch,
         batched=True,
-        batch_size=1000,
+        batch_size=10000,
         num_proc=num_procs,
         remove_columns=sample_dataset.column_names
     )
