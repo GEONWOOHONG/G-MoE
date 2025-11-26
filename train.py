@@ -348,10 +348,34 @@ def train_moe(
 
     from utils import print_model_info as _pmi
     if is_main():
-        _pmi(model, config, mode, eff_num_experts, batch_size=batch_size, grad_accum_steps=grad_accum,
-            effective_batch=batch_size * (world_size if is_dist else 1) * grad_accum)
-        if mode in ("ours_com", "ours_refine"):
-            print(f"🔎 Experts: globals={num_experts}, local_per_layer=1, total_passed={eff_num_experts}")
+        _pmi(
+            model, config, mode, eff_num_experts,
+            batch_size=batch_size,
+            grad_accum_steps=grad_accum,
+            effective_batch=batch_size * (world_size if is_dist else 1) * grad_accum,
+        )
+
+        if mode == "ours_com":
+            print(
+                f"🔎 Experts: globals={num_experts}, local_per_layer=1, "
+                f"total_passed={eff_num_experts}"
+            )
+        elif mode == "ours_refine":
+            if ablate_local:
+                print(
+                    f"🔎 Experts: globals={num_experts}, local_per_layer=0, "
+                    f"total_passed={num_experts} (local expert disabled)"
+                )
+            elif ablate_global:
+                print(
+                    f"🔎 Experts: globals=0, local_per_layer={eff_num_experts}, "
+                    f"total_passed={eff_num_experts} (no shared global experts)"
+                )
+            else:
+                print(
+                    f"🔎 Experts: globals={num_experts}, local_per_layer=1, "
+                    f"total_passed={eff_num_experts}"
+                )
 
     if is_main():
         config.loss_type = "ForCausalLMLoss"
