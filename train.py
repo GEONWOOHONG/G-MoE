@@ -129,6 +129,8 @@ def train_moe(
     continue_training=False, mt=False,
     ablate_local: bool = False,
     ablate_global: bool = False,
+    ablate_logit_prog: bool = False,
+    ablate_global_router: bool = False,
 ):
     is_dist, rank, world_size, local_rank = init_distributed()
 
@@ -197,6 +199,11 @@ def train_moe(
                     f"🧮 ours_refine: globals={n_globals}, locals={n_locals}, "
                     f"total_passed={total} (=globals+1 local)"
                 )
+            
+            if ablate_logit_prog:
+                print("🔥 Ablation Active: Logit Propagation DISABLED (using only GRU state)")
+            if ablate_global_router:
+                print("🔥 Ablation Active: Shared GRU Router DISABLED (using standard Top-k Router for globals)")
     
     vocab_size = 32000 if mt else 50257
     freq_dict = None
@@ -234,6 +241,8 @@ def train_moe(
             freq_dict=freq_dict,
             ablate_local=ablate_local,
             ablate_global=ablate_global,
+            ablate_logit_prog=ablate_logit_prog,
+            ablate_global_router=ablate_global_router,
         )
         best_ckpt = os.path.join(save_dir, "best_checkpoint.safetensors")
         trainer_path = os.path.join(save_dir, "best_checkpoint_trainer.pt")
@@ -264,6 +273,8 @@ def train_moe(
             freq_dict=freq_dict,
             ablate_local=ablate_local,
             ablate_global=ablate_global,
+            ablate_logit_prog=ablate_logit_prog,
+            ablate_global_router=ablate_global_router,
             **(stable_args if mode == "stablemoe" else {})
         )
 
@@ -389,6 +400,8 @@ def train_moe(
         config.loss_type = "ForCausalLMLoss"
         config.ablate_local = bool(ablate_local)
         config.ablate_global = bool(ablate_global)
+        config.ablate_logit_prog = bool(ablate_logit_prog)
+        config.ablate_global_router = bool(ablate_global_router)
         config.save_pretrained(save_dir)
 
     model.to(device)

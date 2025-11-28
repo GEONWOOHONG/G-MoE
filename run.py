@@ -106,6 +106,8 @@ def main():
     tr.add_argument("--mt", action="store_true")
     tr.add_argument("--ablate_local", action="store_true")
     tr.add_argument("--ablate_global", action="store_true")
+    tr.add_argument("--ablate_logit_prog", action="store_true", help="Remove logit propagation in ours_refine")
+    tr.add_argument("--ablate_global_router", action="store_true", help="Replace GRU router with standard router in ours_refine")
     
     ev = sub.add_parser("eval")
     ev.add_argument("--mode", default="switch")
@@ -114,6 +116,8 @@ def main():
     ev.add_argument("--seq_len", type=int, default=1024)
     ev.add_argument("--ablate_local", action="store_true")
     ev.add_argument("--ablate_global", action="store_true")
+    ev.add_argument("--ablate_logit_prog", action="store_true", help="Remove logit propagation in ours_refine")
+    ev.add_argument("--ablate_global_router", action="store_true", help="Replace GRU router with standard router in ours_refine")
            
     an = sub.add_parser("analysis")
     an.add_argument("--modes", type=str, default="switch,gshard,hash,ours_refine", help="Comma-separated mode list")
@@ -126,6 +130,8 @@ def main():
     an.add_argument("--skip_layers", action="store_true", help="Skip layer-level analysis (LEI, CKA, etc.)")
     an.add_argument("--skip_specialization", action="store_true", help="Skip specialization & confidence analysis")
     an.add_argument("--no_flash", action="store_true", help="Disable Flash Attention")
+    an.add_argument("--ablate_logit_prog", action="store_true", help="Remove logit propagation in ours_refine")
+    an.add_argument("--ablate_global_router", action="store_true", help="Replace GRU router with standard router in ours_refine")
 
     args = ap.parse_args()
 
@@ -202,6 +208,8 @@ def main():
             mt=args.mt,
             ablate_local=args.ablate_local,
             ablate_global=args.ablate_global,
+            ablate_logit_prog=args.ablate_logit_prog,
+            ablate_global_router=args.ablate_global_router,
         )
     elif args.cmd == "eval":
         from test import run_all_tests
@@ -210,6 +218,8 @@ def main():
             base_num_experts=args.num_experts,
             ablate_local=args.ablate_local,
             ablate_global=args.ablate_global,
+            ablate_logit_prog=args.ablate_logit_prog,
+            ablate_global_router=args.ablate_global_router,
         )
 
 if __name__ == "__main__":

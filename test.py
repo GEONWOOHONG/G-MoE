@@ -138,7 +138,9 @@ def measure_decode_throughput(model, prompt_ids, gen_len=50, dtype=torch.bfloat1
 
 def run_all_tests(batch_size=44, base_num_experts=16,
                   ablate_local: bool = False,
-                  ablate_global: bool = False):
+                  ablate_global: bool = False,
+                  ablate_logit_prog: bool = False,
+                  ablate_global_router: bool = False):
     set_seed(42)
     if torch.cuda.is_available():
         ensure_flash_attn()
@@ -240,6 +242,8 @@ def run_all_tests(batch_size=44, base_num_experts=16,
                 
             cfg_ablate_local = bool(getattr(config, "ablate_local", False))
             cfg_ablate_global = bool(getattr(config, "ablate_global", False))
+            cfg_ablate_logit_prog = bool(getattr(config, "ablate_logit_prog", False))
+            cfg_ablate_global_router = bool(getattr(config, "ablate_global_router", False))
             
             model = GPT2LMHeadModel(config)
 
@@ -265,6 +269,8 @@ def run_all_tests(batch_size=44, base_num_experts=16,
 
                 use_ablate_local = cfg_ablate_local or (ablate_local and mode == "ours_refine")
                 use_ablate_global = cfg_ablate_global or (ablate_global and mode == "ours_refine")
+                use_ablate_logit_prog = cfg_ablate_logit_prog or (ablate_logit_prog and mode == "ours_refine")
+                use_ablate_global_router = cfg_ablate_global_router or (ablate_global_router and mode == "ours_refine")
 
                 if use_ablate_local and use_ablate_global:
                     raise ValueError("Both local and global ablation requested for ours_refine.")
@@ -274,6 +280,8 @@ def run_all_tests(batch_size=44, base_num_experts=16,
                     num_experts=eff_num_experts, alpha=0.01,
                     ablate_local=use_ablate_local,
                     ablate_global=use_ablate_global,
+                    ablate_logit_prog=use_ablate_logit_prog,
+                    ablate_global_router=use_ablate_global_router,
                     **extra,
                 )
 
