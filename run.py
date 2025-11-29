@@ -108,6 +108,7 @@ def main():
     tr.add_argument("--ablate_global", action="store_true")
     tr.add_argument("--ablate_logit_prog", action="store_true", help="Remove logit propagation in ours_refine")
     tr.add_argument("--ablate_global_router", action="store_true", help="Replace GRU router with standard router in ours_refine")
+    tr.add_argument("--ffn_dim", type=int, default=None, help="Custom FFN dimension size")
     
     ev = sub.add_parser("eval")
     ev.add_argument("--mode", default="switch")
@@ -210,6 +211,7 @@ def main():
             ablate_global=args.ablate_global,
             ablate_logit_prog=args.ablate_logit_prog,
             ablate_global_router=args.ablate_global_router,
+            ffn_dim=args.ffn_dim,
         )
     elif args.cmd == "eval":
         from test import run_all_tests

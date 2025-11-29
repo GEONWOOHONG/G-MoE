@@ -1186,12 +1186,15 @@ class GPT2LayerMoE(nn.Module):
                  ablate_local: bool = False,
                  ablate_global: bool = False,
                  ablate_logit_prog: bool = False,
-                 ablate_global_router: bool = False):
+                 ablate_global_router: bool = False,
+                 d_ff=None):
         super().__init__()
+        if d_ff is None:
+            d_ff = config.n_embd * 4
         self.mode = mode
         self.moe = MoELayer(
             d_model=config.n_embd,
-            d_ff=config.n_embd * 4,
+            d_ff=d_ff,
             num_experts=num_experts,
             mode=mode,
             shared_expert=shared_expert,
@@ -1308,11 +1311,17 @@ def convert_gpt2_to_moe(
     xmoe_expert_mult=0.25,
     stable_routing_dim=50,
     stable_balance_alpha=0.3,
+    target_d_ff=None,
 ):
     if mode == "dense":
         if _rank0():
             print("🔹 Mode is 'dense', returning original GPT-2 model without MoE conversion.")
         return model
+
+    if target_d_ff is not None:
+        eff_d_ff = int(target_d_ff)
+    else:
+        eff_d_ff = config.n_embd * 4
 
     shared_expert = None
     global_experts = None
@@ -1344,7 +1353,7 @@ def convert_gpt2_to_moe(
     if mode == "ours_com":
         assert num_experts >= 2, "ours_com requires at least 2 experts (1 local + N global)."
         global_experts = nn.ModuleList([
-            Expert(config.n_embd, config.n_embd * 4, initializer_range=config.initializer_range)
+            Expert(config.n_embd, eff_d_ff, initializer_range=config.initializer_range)
             for _ in range(num_experts - 1)
         ])
         shared_router = RecurrentRouter(d_model=config.n_embd, hidden_dim=config.n_embd)
@@ -1417,6 +1426,7 @@ def convert_gpt2_to_moe(
         if mode == "ours_com":
             block.mlp = GPT2LayerMoE(
                 config, mode, layer_experts,
+                d_ff=eff_d_ff,
                 shared_expert=None,
                 global_experts=global_experts,
                 alpha=alpha,
@@ -1429,6 +1439,7 @@ def convert_gpt2_to_moe(
         elif mode == "ours_refine":
             block.mlp = GPT2LayerMoE(
                 config, mode, layer_experts,
+                d_ff=eff_d_ff,
                 shared_expert=None,
                 global_experts=global_experts,
                 alpha=alpha,
@@ -1460,6 +1471,7 @@ def convert_gpt2_to_moe(
             )
             layer = GPT2LayerMoE(
                 config, mode, num_experts,
+                d_ff=eff_d_ff,
                 shared_expert=None,
                 global_experts=None,
                 alpha=alpha,
@@ -1473,10 +1485,11 @@ def convert_gpt2_to_moe(
         else:
             layer = GPT2LayerMoE(
                 config, mode, layer_experts,
-                shared_expert,
-                global_experts,
-                alpha,
-                capacity_factor,
+                d_ff=eff_d_ff,
+                shared_expert=shared_expert,
+                global_experts=global_experts,
+                alpha=alpha,
+                capacity_factor=capacity_factor,
                 freq_dict=freq_dict if mode == "hash" else None,
                 xmoe_threshold=xmoe_threshold,
                 xmoe_capacity_factor=xmoe_capacity_factor,

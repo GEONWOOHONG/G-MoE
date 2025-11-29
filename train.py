@@ -131,6 +131,7 @@ def train_moe(
     ablate_global: bool = False,
     ablate_logit_prog: bool = False,
     ablate_global_router: bool = False,
+    ffn_dim: int = None,
 ):
     is_dist, rank, world_size, local_rank = init_distributed()
 
@@ -243,6 +244,7 @@ def train_moe(
             ablate_global=ablate_global,
             ablate_logit_prog=ablate_logit_prog,
             ablate_global_router=ablate_global_router,
+            target_d_ff=ffn_dim,
         )
         best_ckpt = os.path.join(save_dir, "best_checkpoint.safetensors")
         trainer_path = os.path.join(save_dir, "best_checkpoint_trainer.pt")
@@ -275,6 +277,7 @@ def train_moe(
             ablate_global=ablate_global,
             ablate_logit_prog=ablate_logit_prog,
             ablate_global_router=ablate_global_router,
+            target_d_ff=ffn_dim,
             **(stable_args if mode == "stablemoe" else {})
         )
 
@@ -373,6 +376,9 @@ def train_moe(
             grad_accum_steps=grad_accum,
             effective_batch=batch_size * (world_size if is_dist else 1) * grad_accum,
         )
+
+        actual_d_ff = ffn_dim if ffn_dim is not None else config.n_embd * 4
+        print(f"🔧 FFN Dimension Configured: {actual_d_ff} (Default: {config.n_embd*4})")
 
         if mode == "ours_com":
             print(
