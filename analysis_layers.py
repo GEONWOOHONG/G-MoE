@@ -1,3 +1,4 @@
+# analysis_layers.py
 import os, json, time, collections, re
 from typing import Dict, List, Tuple, Optional
 
@@ -41,13 +42,20 @@ def _entropy(p: torch.Tensor) -> torch.Tensor:
     return -(p * p.log()).sum(dim=-1)
 
 class _Recorder:
-    def __init__(self, max_tokens:int=8192, save_routes:bool=True):
+    def __init__(self, max_tokens:int=16384, save_routes:bool=True):
         self.pre_mlp: Dict[int, List[torch.Tensor]]  = collections.defaultdict(list)
         self.post_mlp: Dict[int, List[torch.Tensor]] = collections.defaultdict(list)
         self.route_dist: Dict[int, List[torch.Tensor]] = collections.defaultdict(list)
+        self.token_counts: Dict[int, int] = collections.defaultdict(int)  # [Optimization] 토큰 수 추적
         self.layers: List[int] = []
+        # CKA 분석에 필요한 충분한 양으로 설정 (기존 8192 -> 16384)
         self.max_tokens = int(max_tokens)
         self.save_routes = save_routes
+
+    def is_full(self) -> bool:
+        """모든 레이어에 대해 max_tokens 이상 수집되었는지 확인"""
+        if not self.layers: return False
+        return all(self.token_counts[l] >= self.max_tokens for l in self.layers)
 
     def _trimcat(self, lst: List[torch.Tensor]) -> Optional[torch.Tensor]:
         if not lst: return None
@@ -68,33 +76,65 @@ def _register_hooks(model: nn.Module, rec: _Recorder):
     pat = re.compile(r"^transformer\.h\.(\d+)\.mlp$")
 
     def pre_hook(module, inputs):
+        # [Optimization] 이미 충분한 데이터를 모았으면 복사하지 않음
+        lidx = getattr(module, "_layer_idx", None)
+        if lidx is not None and rec.token_counts[lidx] >= rec.max_tokens:
+            return
+
         x = inputs[0]
         if not isinstance(x, torch.Tensor): return
         B, T, H = x.shape
-        flat = x.reshape(B*T, H).detach().to(torch.float32).cpu()
-        lidx = getattr(module, "_layer_idx", None)
+        # [Optimization] 필요한 만큼만 자르고 CPU로 이동
+        needed = rec.max_tokens - rec.token_counts[lidx]
+        flat = x.reshape(B*T, H)
+        if flat.size(0) > needed:
+            flat = flat[:needed]
+        
+        flat_cpu = flat.detach().to(torch.float32).cpu()
         if lidx is not None:
-            rec.pre_mlp[lidx].append(flat)
+            rec.pre_mlp[lidx].append(flat_cpu)
+            # post_hook에서 카운트 증가를 위해 여기서는 카운트 체크만 함
 
     def fwd_hook(module, inputs, outputs):
+        lidx = getattr(module, "_layer_idx", None)
+        # [Optimization] 이미 충분한 데이터를 모았으면 스킵
+        if lidx is not None and rec.token_counts[lidx] >= rec.max_tokens:
+            return
+
         out = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
         B, T, H = out.shape
-        flat = out.reshape(B*T, H).detach().to(torch.float32).cpu()
-        lidx = getattr(module, "_layer_idx", None)
+        
+        needed = rec.max_tokens - rec.token_counts[lidx]
+        flat = out.reshape(B*T, H)
+        if flat.size(0) > needed:
+            flat = flat[:needed]
+        
+        flat_cpu = flat.detach().to(torch.float32).cpu()
+        
         if lidx is not None:
-            rec.post_mlp[lidx].append(flat)
-        for m in module.modules():
-            if isinstance(m, MoELayer):
-                scores = None
-                if hasattr(m, "router") and getattr(m.router, "last_scores", None) is not None:
-                    scores = m.router.last_scores
-                elif hasattr(m, "xmoe_router") and getattr(m.xmoe_router, "last_scores", None) is not None:
-                    scores = m.xmoe_router.last_scores
-                elif getattr(m, "last_scores", None) is not None:
-                    scores = m.last_scores
-                if scores is not None and rec.save_routes:
-                    probs = torch.softmax(scores, dim=-1)
-                    rec.route_dist[lidx].append(probs.detach().to(torch.float32).cpu())
+            rec.post_mlp[lidx].append(flat_cpu)
+            rec.token_counts[lidx] += flat.size(0) # 여기서 카운트 증가
+
+        # 라우팅 정보 수집
+        if rec.save_routes:
+            for m in module.modules():
+                if isinstance(m, MoELayer):
+                    scores = None
+                    if hasattr(m, "router") and getattr(m.router, "last_scores", None) is not None:
+                        scores = m.router.last_scores
+                    elif hasattr(m, "xmoe_router") and getattr(m.xmoe_router, "last_scores", None) is not None:
+                        scores = m.xmoe_router.last_scores
+                    elif getattr(m, "last_scores", None) is not None:
+                        scores = m.last_scores
+                    
+                    if scores is not None:
+                        # Scores shape: [B, T, E] -> [B*T, E]
+                        flat_scores = scores.view(-1, scores.size(-1))
+                        if flat_scores.size(0) > needed:
+                            flat_scores = flat_scores[:needed]
+                            
+                        probs = torch.softmax(flat_scores, dim=-1)
+                        rec.route_dist[lidx].append(probs.detach().to(torch.float32).cpu())
 
     for name, module in model.named_modules():
         m = pat.match(name)
@@ -110,22 +150,35 @@ def _register_hooks(model: nn.Module, rec: _Recorder):
 def compute_A_metrics(rec: _Recorder) -> Dict:
     layers = sorted(set(rec.layers))
     out = {"LEI": {}, "InterCKA": {}, "InterCKA_by_delta": {}, "IntraRedundancyProxy": {}, "RoutingUsageEntropy": {}, "ActiveExperts": {}, "EmptyExpertsRatio": {}, "IntraExpertCKA": {}}
+    
+    print("Computing metrics based on collected activations...")
     for l in layers:
         X, Y = rec.get_pair(l)
         if X is None or Y is None or X.size(0) != Y.size(0):
             continue
         cos = _cosine_similarity(X, Y)
         out["LEI"][l] = float((1.0 - cos.mean()).item())
+        
     reps = {l: rec.get_pair(l)[1] for l in layers}
     valid_layers = [l for l in layers if reps.get(l) is not None]
+    
+    # Inter-layer CKA
     inter_pairs = {}
     for i, l1 in enumerate(valid_layers):
         for l2 in valid_layers[i+1:]:
             X, Y = reps[l1], reps[l2]
             n = min(X.size(0), Y.size(0))
-            cka = _cka_linear(X[:n], Y[:n])
+            # CKA는 O(N^2) 메모리를 사용하므로 너무 크면 다운샘플링
+            if n > 10000:
+                indices = torch.randperm(n)[:10000]
+                X_sub = X[indices]
+                Y_sub = Y[indices]
+                cka = _cka_linear(X_sub, Y_sub)
+            else:
+                cka = _cka_linear(X[:n], Y[:n])
             key = f"{l1}-{l2}"
             inter_pairs[key] = float(cka.item())
+            
     out["InterCKA"] = inter_pairs
     delta_acc = collections.defaultdict(list)
     for k, v in inter_pairs.items():
@@ -133,6 +186,7 @@ def compute_A_metrics(rec: _Recorder) -> Dict:
         d = abs(int(a) - int(b))
         delta_acc[d].append(v)
     out["InterCKA_by_delta"] = {int(d): float(np.mean(v)) for d, v in delta_acc.items()}
+    
     for l in layers:
         P = rec.get_routes(l)
         if P is None:
@@ -145,16 +199,25 @@ def compute_A_metrics(rec: _Recorder) -> Dict:
         usage_entropy = float(_entropy(freq).item())
         active = int((freq > 0.01).sum().item())
         empty_ratio = float((freq == 0).float().mean().item())
-        Q = P / (P.norm(dim=0, keepdim=True) + 1e-9)
+        
+        # Intra-redundancy (Sampled for speed)
+        if P.size(0) > 5000:
+            Q_sub = P[torch.randperm(P.size(0))[:5000]]
+        else:
+            Q_sub = P
+        Q = Q_sub / (Q_sub.norm(dim=0, keepdim=True) + 1e-9)
         S = torch.einsum("ne,nk->ek", Q, Q)
         mask = (~torch.eye(E, dtype=torch.bool))
         intra_proxy = float(S[mask].mean().item())
+        
         out["RoutingUsageEntropy"][l] = usage_entropy
         out["ActiveExperts"][l] = active
         out["EmptyExpertsRatio"][l] = empty_ratio
+        
+        # IntraExpertCKA
         top1 = torch.argmax(P, dim=-1)
         min_tokens = 32
-        max_tokens = 512
+        max_tokens = 512 # CKA sample limit per expert
         feats = rec.get_pair(l)[1]
         if feats is not None:
             per_expert_indices = []
@@ -187,7 +250,7 @@ def compute_A_metrics(rec: _Recorder) -> Dict:
 @torch.no_grad()
 def run_analysis_A(mode: str = "ours_refine",
                    num_experts: int = 16,
-                   batch_size: int = 32,
+                   batch_size: int = 64,  # Increased default batch size
                    seq_len: int = 1024,
                    max_batches: Optional[int] = None,
                    save_json: Optional[str] = None,
@@ -212,21 +275,24 @@ def run_analysis_A(mode: str = "ours_refine",
     if verbose:
         print(f"Using test set: {len(pile_test)} samples")
     
-    num_workers = min(8, max(2, (os.cpu_count() or 8)//2))
+    num_workers = min(16, max(4, (os.cpu_count() or 8)//2))
     loader = DataLoader(
         eval_ds, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, pin_memory=True,
-        prefetch_factor=2, persistent_workers=False,
+        prefetch_factor=4, persistent_workers=True, # Optimized loader
         worker_init_fn=worker_init_fn, generator=get_dataloader_generator(0)
     )
     total_batches = len(loader)
+    
+    # Layer Analysis는 CKA/LEI 계산용이므로 전체 데이터셋을 다 돌 필요가 없음.
+    # 충분한 통계량(약 16k 토큰)이 모이면 조기 종료함.
     if max_batches is None:
         effective_batches = total_batches
     else:
         effective_batches = min(max_batches, total_batches)
 
     if verbose:
-        print(f"Using {effective_batches}/{total_batches} eval batches")
+        print(f"Using up to {effective_batches}/{total_batches} eval batches (will exit early if sufficient data collected)")
 
     from utils import find_checkpoint_path
     ckpt_path = find_checkpoint_path(mode, CHECKPOINTS_DIR)
@@ -242,14 +308,26 @@ def run_analysis_A(mode: str = "ours_refine",
     load_checkpoint_if_exists(model, mode, CHECKPOINTS_DIR, strict=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device).eval()
-    rec = _Recorder(max_tokens=8192, save_routes=True)
+    
+    # Max tokens for CKA metrics (16384 is enough for stable stats)
+    rec = _Recorder(max_tokens=16384, save_routes=True)
     handles = _register_hooks(model, rec)
+    
     processed = 0
     t0 = time.time()
+    
+    # Main Loop
     for i, batch in enumerate(loader):
         if i >= effective_batches: break
+        
+        # [Optimization] Check if we have enough data
+        if rec.is_full():
+            if verbose: print("✅ Sufficient data collected for layer metrics. Stopping early.")
+            break
+            
         input_ids = batch["input_ids"][:, :seq_len].to(device, non_blocking=True)
         attn      = batch["attention_mask"][:, :seq_len].to(device, non_blocking=True)
+        
         with torch.inference_mode():
             if device.type == "cuda":
                 with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -257,8 +335,10 @@ def run_analysis_A(mode: str = "ours_refine",
             else:
                 _ = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
         processed += 1
+        
         if verbose and processed % 10 == 0:
-            print(f"Processed {processed}/{effective_batches} batches")
+            print(f"Processed {processed} batches...")
+            
     resA = compute_A_metrics(rec)
     result = {
         "mode": mode,
