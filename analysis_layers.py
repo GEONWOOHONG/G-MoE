@@ -227,7 +227,17 @@ def run_analysis_A(mode: str = "ours_refine",
 
     if verbose:
         print(f"Using {effective_batches}/{total_batches} eval batches")
-    config = GPT2Config(vocab_size=50257, n_positions=1024, n_ctx=1024, n_embd=1024, n_layer=8, n_head=8)
+
+    from utils import find_checkpoint_path
+    ckpt_path = find_checkpoint_path(mode, CHECKPOINTS_DIR)
+    
+    if ckpt_path and os.path.exists(os.path.join(os.path.dirname(ckpt_path), "config.json")):
+        config = GPT2Config.from_pretrained(os.path.dirname(ckpt_path))
+        if verbose: print(f"🔹 Loaded config from {os.path.dirname(ckpt_path)}")
+    else:
+        print("⚠️ Config not found, using default parameters (n_embd=768, n_layer=12)")
+        config = GPT2Config(vocab_size=50257, n_positions=1024, n_ctx=1024, n_embd=768, n_layer=12, n_head=12)
+
     model = build_model_for_mode(mode, num_experts=num_experts, config=config)
     load_checkpoint_if_exists(model, mode, CHECKPOINTS_DIR, strict=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
