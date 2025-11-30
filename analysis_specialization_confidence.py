@@ -49,13 +49,20 @@ def load_model_safetensors(model: nn.Module, ckpt_path: str, strict: bool=False)
 
 def load_pile_validation_with_source_labels() -> Tuple["datasets.Dataset", Dict[str,int], Dict[int,str]]:
     from data import load_pile_test
+    import ast
+    
     ds = load_pile_test(verbose=True)
     print(f"Building source label mapping from meta.pile_set_name (using test set)")
+    
+    # meta 데이터가 이미 문자열이므로 바로 사용
     all_sources = set([m for m in ds["meta"]]) 
     source_to_idx = {name: i for i, name in enumerate(sorted(all_sources))}
     idx_to_source = {i: n for n, i in source_to_idx.items()}
+    
     def add_id(example):
+        # example["meta"]가 바로 소스 이름 문자열임
         return {"pile_set_id": source_to_idx[example["meta"]]}
+        
     ds = ds.map(add_id, num_proc=max(1, os.cpu_count()//2))
     ds.set_format(type="torch", columns=["input_ids", "attention_mask", "pile_set_id"])
     print(f"Pile validation prepared: {len(ds)} samples, {len(source_to_idx)} unique sources")
@@ -79,23 +86,32 @@ def analyze_batch_collect(model: nn.Module,
                 scores = module.last_scores
             if scores is not None:
                 probs = torch.softmax(scores.detach(), dim=-1)
-                top2_vals, top2_idx = torch.topk(scores.detach(), k=2, dim=-1)
-                logit_margin = (top2_vals[..., 0] - top2_vals[..., 1])
-                logit_std = scores.detach().float().std(dim=-1, unbiased=False)
-                std_margin = logit_margin / (logit_std + 1e-9)
                 
+                # Check dimension to avoid errors if top_k > num_experts (unlikely but safe)
+                k_val = min(2, scores.size(-1))
+                top2_vals, top2_idx = torch.topk(scores.detach(), k=k_val, dim=-1)
+                
+                if k_val >= 2:
+                    logit_margin = (top2_vals[..., 0] - top2_vals[..., 1])
+                    logit_std = scores.detach().float().std(dim=-1, unbiased=False)
+                    std_margin = logit_margin / (logit_std + 1e-9)
+                    
+                    scores_f = scores.detach().float()
+                    mu = scores_f.mean(dim=-1, keepdim=True)
+                    sd = scores_f.std(dim=-1, keepdim=True, unbiased=False)
+                    z = (scores_f - mu) / (sd + 1e-9)
+                    pz = torch.softmax(z, dim=-1)
+                    z_top1 = torch.gather(pz, -1, top2_idx[..., 0:1]).squeeze(-1)
+                else:
+                    std_margin = torch.zeros_like(top2_vals[..., 0])
+                    z_top1 = torch.zeros_like(top2_vals[..., 0])
+
                 token_entropy = -(probs * (probs.clamp_min(1e-12)).log()).sum(dim=-1)
                 norm_entropy = token_entropy / math.log(probs.size(-1) + 1e-12)
                 
-                scores_f = scores.detach().float()
-                mu = scores_f.mean(dim=-1, keepdim=True)
-                sd = scores_f.std(dim=-1, keepdim=True, unbiased=False)
-                z = (scores_f - mu) / (sd + 1e-9)
-                pz = torch.softmax(z, dim=-1)
-                z_top1 = torch.gather(pz, -1, top2_idx[..., 0:1]).squeeze(-1)
-                
                 top1 = torch.argmax(probs, dim=-1)
                 top1_prob = probs.gather(-1, top1.unsqueeze(-1)).squeeze(-1)
+                
                 per_layer.append({
                     "probs": probs,
                     "top1": top1,
@@ -500,7 +516,16 @@ def run_specialization_confidence(
             print("="*70)
             print(f"Analyzing mode = {mode}")
             print("="*70)
-        config = GPT2Config(vocab_size=50257, n_positions=1024, n_ctx=1024, n_embd=1024, n_layer=8, n_head=8)
+        
+        # [Fix: Load config from checkpoint]
+        ckpt_path = pick_ckpt_path(mode)
+        if ckpt_path and os.path.exists(os.path.join(os.path.dirname(ckpt_path), "config.json")):
+             config = GPT2Config.from_pretrained(os.path.dirname(ckpt_path))
+             if verbose: print(f"🔹 Loaded config from {os.path.dirname(ckpt_path)}")
+        else:
+             print("⚠️ Config not found, using default parameters (n_embd=768, n_layer=12)")
+             config = GPT2Config(vocab_size=50257, n_positions=1024, n_ctx=1024, n_embd=768, n_layer=12, n_head=12)
+
         model = build_model_for_mode(mode, num_experts=num_experts, config=config)
         load_checkpoint_if_exists(model, mode, CHECKPOINTS_DIR, strict=False)
         model.to(device).eval()
@@ -517,7 +542,13 @@ def run_specialization_confidence(
                 break
             input_ids = batch["input_ids"][:, :seq_len].to(device, non_blocking=True)
             mask = batch["attention_mask"][:, :seq_len].to(device, non_blocking=True)
-            pile_set_ids = batch["pile_set_id"][:, :seq_len]
+            
+            # [Fix: Broadcast pile_set_id to sequence length]
+            # pile_set_id from loader is [B], so we expand it to [B, S]
+            current_bsz, current_seq = input_ids.shape
+            pile_set_ids_scalar = batch["pile_set_id"].view(current_bsz, 1)
+            pile_set_ids = pile_set_ids_scalar.expand(current_bsz, current_seq)
+
             with torch.inference_mode():
                 if device.type == "cuda":
                     with torch.autocast("cuda", dtype=torch.bfloat16):
