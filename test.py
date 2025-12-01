@@ -140,7 +140,8 @@ def run_all_tests(batch_size=44, base_num_experts=16,
                   ablate_local: bool = False,
                   ablate_global: bool = False,
                   ablate_logit_prog: bool = False,
-                  ablate_global_router: bool = False):
+                  ablate_global_router: bool = False,
+                  ffn_dim: int = None):
     set_seed(42)
     if torch.cuda.is_available():
         ensure_flash_attn()
@@ -282,6 +283,7 @@ def run_all_tests(batch_size=44, base_num_experts=16,
                     ablate_global=use_ablate_global,
                     ablate_logit_prog=use_ablate_logit_prog,
                     ablate_global_router=use_ablate_global_router,
+                    target_d_ff=ffn_dim,
                     **extra,
                 )
 

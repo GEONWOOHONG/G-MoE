@@ -119,7 +119,8 @@ def main():
     ev.add_argument("--ablate_global", action="store_true")
     ev.add_argument("--ablate_logit_prog", action="store_true", help="Remove logit propagation in ours_refine")
     ev.add_argument("--ablate_global_router", action="store_true", help="Replace GRU router with standard router in ours_refine")
-           
+    ev.add_argument("--ffn_dim", type=int, default=None, help="Custom FFN dimension size")
+     
     an = sub.add_parser("analysis")
     an.add_argument("--modes", type=str, default="dense,switch,gshard,hash,ours_refine", help="Comma-separated mode list")
     an.add_argument("--num_experts", type=int, default=16)
@@ -221,6 +222,7 @@ def main():
             ablate_global=args.ablate_global,
             ablate_logit_prog=args.ablate_logit_prog,
             ablate_global_router=args.ablate_global_router,
+            ffn_dim=args.ffn_dim,
         )
 
 if __name__ == "__main__":
@@ -228,7 +230,7 @@ if __name__ == "__main__":
 
 #python run.py train --mode ours_refine --num_experts 4 --batch_size 4 --seq_len 1024 --grad_accum 2
 #torchrun --nproc_per_node=8 --master_port=29600 run.py train --mode switch --num_experts 16 --batch_size 64 --seq_len 1024 --grad_accum 1 --ffn_dim 731
-#python run.py eval --batch_size 44 --num_experts 16
+#python run.py eval --batch_size 64 --num_experts 16 --ffn_dim 731
 
 # Full analysis (all modes, all metrics):
 #python run.py analysis --modes switch,gshard,hash,ours_refine --batch_size 44 --num_experts 16
