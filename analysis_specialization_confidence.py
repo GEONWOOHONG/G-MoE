@@ -42,25 +42,17 @@ def pick_ckpt_path(mode: str) -> Optional[str]:
     from utils import find_checkpoint_path
     return find_checkpoint_path(mode, CHECKPOINTS_DIR)
 
-def load_model_safetensors(model: nn.Module, ckpt_path: str, strict: bool=False):
-    from utils import load_safetensors
-    load_safetensors(model, ckpt_path, strict=strict)
-    print(f"Loaded tensors from: {ckpt_path}")
-
 def load_pile_validation_with_source_labels() -> Tuple["datasets.Dataset", Dict[str,int], Dict[int,str]]:
     from data import load_pile_test
-    import ast
     
     ds = load_pile_test(verbose=True)
     print(f"Building source label mapping from meta.pile_set_name (using test set)")
     
-    # meta 데이터가 이미 문자열이므로 바로 사용
     all_sources = set([m for m in ds["meta"]]) 
     source_to_idx = {name: i for i, name in enumerate(sorted(all_sources))}
     idx_to_source = {i: n for n, i in source_to_idx.items()}
     
     def add_id(example):
-        # example["meta"]가 바로 소스 이름 문자열임
         return {"pile_set_id": source_to_idx[example["meta"]]}
         
     ds = ds.map(add_id, num_proc=max(1, os.cpu_count()//2))
@@ -69,12 +61,17 @@ def load_pile_validation_with_source_labels() -> Tuple["datasets.Dataset", Dict[
     return ds, source_to_idx, idx_to_source
 
 @torch.no_grad()
-def analyze_batch_collect(model: nn.Module,
-                          input_ids: torch.Tensor,
-                          attention_mask: Optional[torch.Tensor] = None) -> List[Dict[str, torch.Tensor]]:
+def analyze_batch_collect_specialization(model: nn.Module,
+                                         input_ids: torch.Tensor,
+                                         attention_mask: Optional[torch.Tensor] = None) -> List[Dict[str, torch.Tensor]]:
+    """
+    신뢰도 통계(Entropy, Margin 등)를 모두 제거하고,
+    오직 '어떤 전문가가 선택되었는지(Top-1 Expert ID)'만 수집합니다.
+    """
     model.eval()
     _ = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
     per_layer = []
+    
     for module in model.modules():
         if isinstance(module, MoELayer):
             scores = None
@@ -84,172 +81,51 @@ def analyze_batch_collect(model: nn.Module,
                 scores = module.xmoe_router.last_scores
             elif getattr(module, "last_scores", None) is not None:
                 scores = module.last_scores
+            
             if scores is not None:
-                probs = torch.softmax(scores.detach(), dim=-1)
-                
-                # Check dimension to avoid errors if top_k > num_experts (unlikely but safe)
-                k_val = min(2, scores.size(-1))
-                top2_vals, top2_idx = torch.topk(scores.detach(), k=k_val, dim=-1)
-                
-                if k_val >= 2:
-                    logit_margin = (top2_vals[..., 0] - top2_vals[..., 1])
-                    logit_std = scores.detach().float().std(dim=-1, unbiased=False)
-                    std_margin = logit_margin / (logit_std + 1e-9)
-                    
-                    scores_f = scores.detach().float()
-                    mu = scores_f.mean(dim=-1, keepdim=True)
-                    sd = scores_f.std(dim=-1, keepdim=True, unbiased=False)
-                    z = (scores_f - mu) / (sd + 1e-9)
-                    pz = torch.softmax(z, dim=-1)
-                    z_top1 = torch.gather(pz, -1, top2_idx[..., 0:1]).squeeze(-1)
-                else:
-                    std_margin = torch.zeros_like(top2_vals[..., 0])
-                    z_top1 = torch.zeros_like(top2_vals[..., 0])
-
-                token_entropy = -(probs * (probs.clamp_min(1e-12)).log()).sum(dim=-1)
-                norm_entropy = token_entropy / math.log(probs.size(-1) + 1e-12)
-                
-                top1 = torch.argmax(probs, dim=-1)
-                top1_prob = probs.gather(-1, top1.unsqueeze(-1)).squeeze(-1)
-                
-                per_layer.append({
-                    "probs": probs,
-                    "top1": top1,
-                    "top1_prob": top1_prob,
-                    "std_margin": std_margin,
-                    "norm_entropy": norm_entropy,
-                    "z_top1_prob": z_top1,
-                })
+                # 확률 계산 없이 바로 가장 점수가 높은 전문가 인덱스만 추출
+                top1 = torch.argmax(scores.detach(), dim=-1)
+                per_layer.append({"top1": top1})
             else:
-                per_layer.append({
-                    "probs": None, "top1": None, "top1_prob": None,
-                    "std_margin": None, "norm_entropy": None, "z_top1_prob": None
-                })
+                per_layer.append({"top1": None})
     return per_layer
 
-@torch.no_grad()
-def forward_with_token_nll(model: nn.Module,
-                           input_ids: torch.Tensor,
-                           attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-    out = model(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids)
-    logits = out.logits[:, :-1, :].float()
-    labels = input_ids[:, 1:]
-    if attention_mask is not None:
-        mask = attention_mask[:, 1:].float()
-    else:
-        mask = torch.ones_like(labels, dtype=torch.float)
-    logp = torch.log_softmax(logits, dim=-1)
-    nll = -(logp.gather(-1, labels.unsqueeze(-1)).squeeze(-1))
-    nll = nll * mask
-    return nll
-
-def accumulate_specialization_and_confidence(per_layer: List[Dict[str, torch.Tensor]],
-                                             pile_set_ids: torch.Tensor,
-                                             stats_spec: Dict,
-                                             stats_conf: Dict,
-                                             stats_conf_by_source: Dict,
-                                             token_nll: Optional[torch.Tensor] = None):
-    B, S = pile_set_ids.shape
-
+def accumulate_specialization(per_layer: List[Dict[str, torch.Tensor]],
+                              pile_set_ids: torch.Tensor,
+                              stats_spec: Dict):
+    """
+    NLL 및 신뢰도 관련 누적 로직 제거.
+    오직 (Layer, Expert, Source) 조합의 빈도수만 카운트합니다.
+    """
     token_sources_all = pile_set_ids.reshape(-1).cpu().tolist()
-
-    nll_flat = None
-    valid_idx = None
-    if token_nll is not None:
-        # forward_with_token_nll 에서 나온 [B, S-1]
-        nll_flat = token_nll.reshape(-1).float().cpu().numpy()
-
-        mask = torch.zeros(B, S, dtype=torch.bool)
-        mask[:, 1:] = True
-        valid_idx = torch.nonzero(mask.view(-1), as_tuple=False).view(-1).cpu().numpy()
-
-        if len(nll_flat) != len(valid_idx):
-            L = min(len(nll_flat), len(valid_idx))
-            nll_flat = nll_flat[:L]
-            valid_idx = valid_idx[:L]
 
     layer_idx = -1
     for entry in per_layer:
         layer_idx += 1
-        probs = entry.get("probs", None)
         top1 = entry.get("top1", None)
-        top1_prob = entry.get("top1_prob", None)
-        if probs is None and top1 is None:
+        
+        if top1 is None:
             continue
 
-        if probs is not None:
-            # probs: [N_tokens, N_experts] or [B, S, N_experts]
-            probs_flat = probs.view(-1, probs.size(-1))
-            expert_ids_all = torch.argmax(probs_flat, dim=-1).cpu().tolist()
+        # [B, S] -> [B*S]
+        expert_ids_all = top1.view(-1).cpu().tolist()
 
-            if top1_prob is not None:
-                max_probs_all = top1_prob.view(-1).float().cpu().numpy()
-            else:
-                max_probs_all = np.full(len(expert_ids_all), np.nan, dtype=np.float32)
-
-            std_m = entry.get("std_margin", None)
-            nH = entry.get("norm_entropy", None)
-            z_p1 = entry.get("z_top1_prob", None)
-
-            std_m_all = std_m.view(-1).cpu().numpy() if std_m is not None else None
-            nH_all = nH.view(-1).cpu().numpy() if nH is not None else None
-            z_p1_all = z_p1.view(-1).cpu().numpy() if z_p1 is not None else None
-        else:
-            top1_flat = top1.view(-1)
-            expert_ids_all = top1_flat.cpu().tolist()
-            max_probs_all = np.full(len(expert_ids_all), np.nan, dtype=np.float32)
-            std_m_all = nH_all = z_p1_all = None
-
+        # 길이 맞추기 (배치 내 유효 토큰 수 등)
         N_all = min(len(token_sources_all), len(expert_ids_all))
         expert_ids_all = expert_ids_all[:N_all]
-        max_probs_all = max_probs_all[:N_all]
-        if std_m_all is not None:
-            std_m_all = std_m_all[:N_all]
-        if nH_all is not None:
-            nH_all = nH_all[:N_all]
-        if z_p1_all is not None:
-            z_p1_all = z_p1_all[:N_all]
         token_sources_all_use = token_sources_all[:N_all]
 
+        # 카운팅
         c = stats_spec[layer_idx]
         for eid, sid in zip(expert_ids_all, token_sources_all_use):
             c[eid][sid] += 1
 
-        cs = stats_conf_by_source[layer_idx]
-        for p, eid, sid in zip(max_probs_all, expert_ids_all, token_sources_all_use):
-            if not np.isnan(p):
-                cs[eid][sid].append(float(p))
-
-        cc = stats_conf[layer_idx]
-        if nll_flat is not None and valid_idx is not None and len(valid_idx) > 0:
-            valid_idx_clipped = [int(i) for i in valid_idx if i < N_all]
-            if not valid_idx_clipped:
-                continue
-
-            L = min(len(valid_idx_clipped), len(nll_flat))
-            if L == 0:
-                continue
-            valid_idx_clipped = valid_idx_clipped[:L]
-
-            expert_ids_nll = [expert_ids_all[i] for i in valid_idx_clipped]
-            max_probs_nll = max_probs_all[valid_idx_clipped]
-
-            cc.setdefault("expert_choices", []).extend(expert_ids_nll)
-            cc.setdefault("top1_probs", []).extend(max_probs_nll.tolist())
-
-            if std_m_all is not None:
-                cc.setdefault("std_margin", []).extend(std_m_all[valid_idx_clipped].tolist())
-            if nH_all is not None:
-                cc.setdefault("norm_entropy", []).extend(nH_all[valid_idx_clipped].tolist())
-            if z_p1_all is not None:
-                cc.setdefault("z_top1_prob", []).extend(z_p1_all[valid_idx_clipped].tolist())
-
-            cc.setdefault("token_nll", []).extend(nll_flat[:L].tolist())
-
 def finalize_specialization_tables(stats_spec: Dict,
-                                   idx_to_source: Dict[int, str],
-                                   stats_conf_by_source: Dict,
-                                   source_cardinality: int) -> pd.DataFrame:
+                                   idx_to_source: Dict[int, str]) -> pd.DataFrame:
+    """
+    신뢰도(Confidence) 관련 컬럼 병합 로직 제거.
+    특화도(Specialization Index)와 엔트로피(Source Entropy)만 계산합니다.
+    """
     rows = []
     for layer, exp_dict in stats_spec.items():
         for eid, src_counter in exp_dict.items():
@@ -261,16 +137,28 @@ def finalize_specialization_tables(stats_spec: Dict,
                     "Pile_Set_Name": idx_to_source[sid],
                     "Activation_Count": int(cnt)
                 })
+    
     if not rows:
         return pd.DataFrame()
+    
     df = pd.DataFrame(rows)
+    
+    # 1. 전문가별 총 활성화 횟수
     df["Expert_Total_Activation"] = df.groupby(["Layer","Expert_ID"])["Activation_Count"].transform("sum")
+    
+    # 2. P(Source | Expert)
     df["P_Source_Given_Expert"] = df["Activation_Count"] / (df["Expert_Total_Activation"] + 1e-12)
+    
+    # 3. P(Source)_Global (전체 데이터 분포)
     total_act = df["Activation_Count"].sum()
     gsrc = df.groupby("Pile_Set_Name")["Activation_Count"].sum() / float(total_act)
     gdf = gsrc.rename("P_Source_Global").reset_index()
     df = df.merge(gdf, on="Pile_Set_Name", how="left")
+    
+    # 4. Specialization Index (특화 지수)
     df["Specialization_Index"] = df["P_Source_Given_Expert"] / (df["P_Source_Global"] + 1e-10)
+    
+    # 5. 각 전문가가 가장 특화된 소스 찾기
     idxmax = df.groupby(["Layer","Expert_ID"])["Specialization_Index"].idxmax()
     max_df = df.loc[idxmax, ["Layer","Expert_ID","Pile_Set_Name","Specialization_Index"]].copy()
     max_df = max_df.rename(columns={
@@ -278,168 +166,21 @@ def finalize_specialization_tables(stats_spec: Dict,
         "Specialization_Index":"Max_Specialization_Index"
     })
     df = df.merge(max_df, on=["Layer","Expert_ID"], how="left")
+    
+    # 6. Source Entropy (해당 전문가가 얼마나 다양한 소스를 처리하는지)
     ent = df.groupby(["Layer","Expert_ID"])["P_Source_Given_Expert"].apply(lambda s: entropy(s.values, base=2))
     ent = ent.rename("Source_Entropy").reset_index()
     df = df.merge(ent, on=["Layer","Expert_ID"], how="left")
-    rows_conf = []
-    for layer, exp_dict in stats_conf_by_source.items():
-        for eid, sdict in exp_dict.items():
-            for sid, probs in sdict.items():
-                if not probs:
-                    continue
-                rows_conf.append({
-                    "Layer": layer, "Expert_ID": eid, "Pile_Set_ID": sid,
-                    "Pile_Set_Name": idx_to_source[sid],
-                    "Avg_Confidence_for_Source": float(np.mean(probs)),
-                    "Std_Confidence_for_Source": float(np.std(probs))
-                })
-    if rows_conf:
-        cdf = pd.DataFrame(rows_conf)
-        df = df.merge(cdf, on=["Layer","Expert_ID","Pile_Set_ID","Pile_Set_Name"], how="left")
+    
     preferred_cols = [
         "Layer","Expert_ID","Pile_Set_Name","Activation_Count",
         "Expert_Total_Activation","P_Source_Global","P_Source_Given_Expert",
         "Specialization_Index","Max_Specialized_Source","Max_Specialization_Index",
-        "Source_Entropy","Avg_Confidence_for_Source","Std_Confidence_for_Source"
+        "Source_Entropy"
     ]
-    cols = [c for c in preferred_cols if c in df.columns] + [c for c in df.columns if c not in preferred_cols]
+    cols = [c for c in preferred_cols if c in df.columns]
     df = df[cols]
     return df
-
-def finalize_confidence_tables(stats_conf: Dict, model_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    conf_rows = []
-    hist_rows = []
-    for layer, d in stats_conf.items():
-        probs = np.array(d.get("top1_probs", []), dtype=np.float32)
-        probs = probs[~np.isnan(probs)]
-        choices = np.array(d["expert_choices"], dtype=np.int32)
-        std_m = np.array(d.get("std_margin", []), dtype=np.float32) if "std_margin" in d else None
-        nH = np.array(d.get("norm_entropy", []), dtype=np.float32) if "norm_entropy" in d else None
-        z_p1 = np.array(d.get("z_top1_prob", []), dtype=np.float32) if "z_top1_prob" in d else None
-        
-        if choices.size == 0:
-            continue
-        vals, cnts = np.unique(choices, return_counts=True)
-        freqs = cnts / cnts.sum()
-        ent = float(-np.sum(freqs * np.log(freqs + 1e-12))) if freqs.size > 0 else 0.0
-        if probs.size > 0:
-            very = float(np.mean(probs > 0.9))
-            mid  = float(np.mean((probs > 0.75) & (probs <= 0.9)))
-            low  = float(np.mean((probs > 0.5) & (probs <= 0.75)))
-            unc  = float(np.mean(probs <= 0.5))
-            avgp, stdp = float(probs.mean()), float(probs.std())
-            pmin, pmax = float(probs.min()), float(probs.max())
-        else:
-            very = mid = low = unc = 0.0
-            avgp = stdp = pmin = pmax = 0.0
-        
-        row = {
-            "Model": model_name,
-            "Layer": int(layer),
-            "Entropy": ent,
-            "Avg_Top1_Prob": avgp,
-            "Std_Top1_Prob": stdp,
-            "Min_Top1_Prob": pmin,
-            "Max_Top1_Prob": pmax,
-            "Very_Confident_Ratio_P_gt_0.9": very,
-            "Moderate_Confident_Ratio_0.75_lt_P_le_0.9": mid,
-            "Low_Confidence_Ratio_0.5_lt_P_le_0.75": low,
-            "Uncertain_Ratio_P_le_0.5": unc,
-            "Num_Active_Experts_gt_1pct": float((freqs > 0.01).sum()),
-            "Total_Decisions": int(choices.size)
-        }
-        if std_m is not None and std_m.size > 0:
-            std_m = std_m[~np.isnan(std_m)]
-            row["Avg_StdMargin"] = float(std_m.mean()) if std_m.size > 0 else 0.0
-            row["Std_StdMargin"] = float(std_m.std()) if std_m.size > 0 else 0.0
-        if nH is not None and nH.size > 0:
-            nH = nH[~np.isnan(nH)]
-            row["Avg_NormEntropy"] = float(nH.mean()) if nH.size > 0 else 0.0
-            row["Std_NormEntropy"] = float(nH.std()) if nH.size > 0 else 0.0
-        if z_p1 is not None and z_p1.size > 0:
-            z_p1 = z_p1[~np.isnan(z_p1)]
-            row["Avg_ZTop1Prob"] = float(z_p1.mean()) if z_p1.size > 0 else 0.0
-            row["Std_ZTop1Prob"] = float(z_p1.std()) if z_p1.size > 0 else 0.0
-        conf_rows.append(row)
-        
-        if probs.size > 0:
-            counts, bins = np.histogram(probs, bins=20, range=(0.0, 1.0))
-            for i in range(len(counts)):
-                bin_center = (bins[i] + bins[i+1]) * 0.5
-                bin_width  = (bins[i+1] - bins[i])
-                hist_rows.append({
-                    "Model": model_name,
-                    "Layer": int(layer),
-                    "Bin_Index": i,
-                    "Bin_Start": float(bins[i]),
-                    "Bin_End": float(bins[i+1]),
-                    "Bin_Center": float(bin_center),
-                    "Bin_Width": float(bin_width),
-                    "Count": int(counts[i]),
-                    "Density": float(counts[i] / (max(1, probs.size) * bin_width))
-                })
-    cdf = pd.DataFrame(conf_rows) if conf_rows else pd.DataFrame()
-    hdf = pd.DataFrame(hist_rows) if hist_rows else pd.DataFrame()
-    return cdf, hdf
-
-def summarize_confidence_quality(stats_conf: Dict, model_name: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    from scipy.stats import spearmanr, pearsonr
-    
-    rows = []
-    bin_rows = []
-    bins = np.linspace(0.0, 1.0, 21)
-    
-    for layer, d in stats_conf.items():
-        if not d.get("token_nll"):
-            continue
-        nll = np.array(d["token_nll"], dtype=np.float32)
-        z_p = np.array(d.get("z_top1_prob", []), dtype=np.float32) if "z_top1_prob" in d else None
-        m = np.array(d.get("std_margin", []), dtype=np.float32) if "std_margin" in d else None
-        nH = np.array(d.get("norm_entropy", []), dtype=np.float32) if "norm_entropy" in d else None
-        
-        def corr(a, b):
-            if a is None or b is None:
-                return np.nan, np.nan
-            ok = np.isfinite(a) & np.isfinite(b)
-            if ok.sum() < 100:
-                return np.nan, np.nan
-            s = spearmanr(a[ok], b[ok]).correlation
-            p = pearsonr(a[ok], b[ok])[0]
-            return s, p
-        
-        s_z, p_z = corr(-nll, z_p) if z_p is not None else (np.nan, np.nan)
-        s_m, p_m = corr(-nll, m) if m is not None else (np.nan, np.nan)
-        s_h, p_h = corr(nll, nH) if nH is not None else (np.nan, np.nan)
-        
-        if z_p is not None and z_p.size > 0:
-            dig = np.digitize(z_p, bins) - 1
-            for bi in range(len(bins)-1):
-                sel = dig == bi
-                if sel.sum() == 0:
-                    continue
-                bin_rows.append({
-                    "Model": model_name,
-                    "Layer": int(layer),
-                    "BinStart": float(bins[bi]),
-                    "BinEnd": float(bins[bi+1]),
-                    "Count": int(sel.sum()),
-                    "AvgNLL": float(nll[sel].mean()),
-                    "StdNLL": float(nll[sel].std()),
-                    "AvgZTop1": float(z_p[sel].mean()),
-                })
-        
-        rows.append({
-            "Model": model_name,
-            "Layer": int(layer),
-            "Spearman_negNLL_vs_ZTop1": float(s_z),
-            "Pearson_negNLL_vs_ZTop1": float(p_z),
-            "Spearman_negNLL_vs_StdMargin": float(s_m),
-            "Pearson_negNLL_vs_StdMargin": float(p_m),
-            "Spearman_NLL_vs_NormEntropy": float(s_h),
-            "Pearson_NLL_vs_NormEntropy": float(p_h),
-        })
-    
-    return pd.DataFrame(rows), pd.DataFrame(bin_rows)
 
 def extract_model_metadata(model: nn.Module, mode: str, num_experts: int) -> Dict:
     active_k = 1
@@ -456,12 +197,9 @@ def extract_model_metadata(model: nn.Module, mode: str, num_experts: int) -> Dic
                 aux_alpha = getattr(module.xmoe_router, "aux_alpha", None)
             break
     
-    if mode == "gshard":
-        active_k = 2
-    elif mode == "switch":
-        active_k = 1
-    elif mode == "hash":
-        active_k = 1
+    if mode == "gshard": active_k = 2
+    elif mode == "switch": active_k = 1
+    elif mode == "hash": active_k = 1
     
     return {
         "Model": mode,
@@ -470,10 +208,9 @@ def extract_model_metadata(model: nn.Module, mode: str, num_experts: int) -> Dic
         "CapacityFactor": capacity_factor if capacity_factor is not None else "N/A",
         "DroplessEval": True,
         "AuxAlpha": aux_alpha if aux_alpha is not None else 0.0,
-        "HasAux": bool(aux_alpha not in (0.0, None)) if aux_alpha is not None else False,
     }
 
-def run_specialization_confidence(
+def run_specialization_only(
     modes: List[str] = ("switch","gshard","hash","ours_refine"),
     num_experts: int = 16,
     batch_size: int = 44,
@@ -488,9 +225,11 @@ def run_specialization_confidence(
         ensure_flash_attn()
     if verbose:
         print("="*70)
-        print("Specialization and Confidence Analysis")
+        print("Specialization Analysis Only (No Confidence/NLL Metrics)")
         print("="*70)
+        
     ds, source_to_idx, idx_to_source = load_pile_validation_with_source_labels()
+    
     nworkers = min(8, max(2, (os.cpu_count() or 8)//2))
     loader = DataLoader(
         ds, batch_size=batch_size, shuffle=False,
@@ -499,31 +238,29 @@ def run_specialization_confidence(
         worker_init_fn=worker_init_fn,
         generator=get_dataloader_generator(0),
     )
+    
     total_batches = len(loader)
     if max_batches is None:
         max_batches = max(1, int(total_batches * sample_fraction))
         if verbose:
             print(f"Using approximately {sample_fraction*100:.0f}% of validation: {max_batches}/{total_batches} batches")
+            
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     all_spec_tables = []
-    all_conf_tables = []
-    all_hist_tables = []
     meta_rows = []
     
     for mode in modes:
-        assert mode in {"dense","switch","gshard","hash","ours_refine"}, f"Unsupported mode: {mode}"
         if verbose:
             print("="*70)
             print(f"Analyzing mode = {mode}")
             print("="*70)
         
-        # [Fix: Load config from checkpoint]
         ckpt_path = pick_ckpt_path(mode)
         if ckpt_path and os.path.exists(os.path.join(os.path.dirname(ckpt_path), "config.json")):
              config = GPT2Config.from_pretrained(os.path.dirname(ckpt_path))
              if verbose: print(f"🔹 Loaded config from {os.path.dirname(ckpt_path)}")
         else:
-             print("⚠️ Config not found, using default parameters (n_embd=768, n_layer=12)")
+             print("⚠️ Config not found, using default parameters")
              config = GPT2Config(vocab_size=50257, n_positions=1024, n_ctx=1024, n_embd=768, n_layer=12, n_head=12)
 
         model = build_model_for_mode(mode, num_experts=num_experts, config=config)
@@ -533,9 +270,9 @@ def run_specialization_confidence(
         meta = extract_model_metadata(model, mode, num_experts)
         meta_rows.append(meta)
         
+        # 신뢰도 관련 stats_conf 제거됨
         stats_spec = defaultdict(lambda: defaultdict(Counter))
-        stats_conf = defaultdict(lambda: {"top1_probs": [], "expert_choices": []})
-        stats_conf_by_source = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+        
         processed = 0
         for i, batch in enumerate(loader):
             if i >= max_batches:
@@ -543,8 +280,6 @@ def run_specialization_confidence(
             input_ids = batch["input_ids"][:, :seq_len].to(device, non_blocking=True)
             mask = batch["attention_mask"][:, :seq_len].to(device, non_blocking=True)
             
-            # [Fix: Broadcast pile_set_id to sequence length]
-            # pile_set_id from loader is [B], so we expand it to [B, S]
             current_bsz, current_seq = input_ids.shape
             pile_set_ids_scalar = batch["pile_set_id"].view(current_bsz, 1)
             pile_set_ids = pile_set_ids_scalar.expand(current_bsz, current_seq)
@@ -552,51 +287,29 @@ def run_specialization_confidence(
             with torch.inference_mode():
                 if device.type == "cuda":
                     with torch.autocast("cuda", dtype=torch.bfloat16):
-                        per_layer = analyze_batch_collect(model, input_ids, mask)
-                    with torch.autocast("cuda", enabled=False):
-                        token_nll = forward_with_token_nll(model, input_ids, mask)
+                        # Token NLL 계산(forward_with_token_nll) 제거됨
+                        per_layer = analyze_batch_collect_specialization(model, input_ids, mask)
                 else:
-                    per_layer = analyze_batch_collect(model, input_ids, mask)
-                    token_nll = forward_with_token_nll(model, input_ids, mask)
+                    per_layer = analyze_batch_collect_specialization(model, input_ids, mask)
             
-            accumulate_specialization_and_confidence(
-                per_layer,
-                pile_set_ids,
-                stats_spec,
-                stats_conf,
-                stats_conf_by_source,
-                token_nll,
-            )
+            accumulate_specialization(per_layer, pile_set_ids, stats_spec)
             
             processed += 1
             if verbose and processed % 10 == 0:
                 print(f"Processed {processed}/{max_batches} batches")
-        spec_df = finalize_specialization_tables(stats_spec, idx_to_source, stats_conf_by_source, source_cardinality=len(source_to_idx))
+        
+        # 신뢰도 테이블 생성 함수 호출 제거
+        spec_df = finalize_specialization_tables(stats_spec, idx_to_source)
+        
         if not spec_df.empty:
             spec_df.insert(0, "Model", mode)
             all_spec_tables.append(spec_df)
-        conf_df, hist_df = finalize_confidence_tables(stats_conf, model_name=mode)
-        if not conf_df.empty:
-            all_conf_tables.append(conf_df)
-        if not hist_df.empty:
-            all_hist_tables.append(hist_df)
-        
-        qual_df, bin_df = summarize_confidence_quality(stats_conf, model_name=mode)
-        if not qual_df.empty:
-            if "quality_tables" not in locals():
-                quality_tables = []
-            quality_tables.append(qual_df)
-        if not bin_df.empty:
-            if "bin_tables" not in locals():
-                bin_tables = []
-            bin_tables.append(bin_df)
         
         del model
         torch.cuda.empty_cache()
+
     os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
     outputs = {}
-    quality_tables = locals().get("quality_tables", [])
-    bin_tables = locals().get("bin_tables", [])
     
     if all_spec_tables:
         spec_out = os.path.join(CHECKPOINTS_DIR, "expert_source_mapping_with_specialization.csv")
@@ -607,48 +320,16 @@ def run_specialization_confidence(
     else:
         if verbose:
             print("No specialization table produced")
-    if all_conf_tables:
-        conf_out = os.path.join(CHECKPOINTS_DIR, "routing_confidence_analysis.csv")
-        pd.concat(all_conf_tables, ignore_index=True).to_csv(conf_out, index=False)
-        if verbose:
-            print(f"Confidence CSV saved: {conf_out}")
-        outputs["confidence_csv"] = conf_out
-    else:
-        if verbose:
-            print("No confidence table produced")
-    if all_hist_tables:
-        hist_out = os.path.join(CHECKPOINTS_DIR, "routing_confidence_histogram.csv")
-        pd.concat(all_hist_tables, ignore_index=True).to_csv(hist_out, index=False)
-        if verbose:
-            print(f"Confidence histogram CSV saved: {hist_out}")
-        outputs["confidence_histogram_csv"] = hist_out
-    
-    if quality_tables:
-        qual_out = os.path.join(CHECKPOINTS_DIR, "routing_confidence_quality_correlation.csv")
-        pd.concat(quality_tables, ignore_index=True).to_csv(qual_out, index=False)
-        if verbose:
-            print(f"Confidence quality correlation CSV saved: {qual_out}")
-        outputs["quality_correlation_csv"] = qual_out
-    
-    if bin_tables:
-        bin_out = os.path.join(CHECKPOINTS_DIR, "routing_confidence_binned_nll.csv")
-        pd.concat(bin_tables, ignore_index=True).to_csv(bin_out, index=False)
-        if verbose:
-            print(f"Binned NLL CSV saved: {bin_out}")
-        outputs["binned_nll_csv"] = bin_out
-    
+            
     if meta_rows:
         meta_out = os.path.join(CHECKPOINTS_DIR, "routing_experiment_meta.csv")
         pd.DataFrame(meta_rows).to_csv(meta_out, index=False)
-        if verbose:
-            print(f"Experiment metadata CSV saved: {meta_out}")
         outputs["experiment_meta_csv"] = meta_out
     
     summary_path = os.path.join(CHECKPOINTS_DIR, "analysis_specialization_summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(outputs, f, indent=2)
-    if verbose:
-        print(f"Summary JSON: {summary_path}")
+    
     return outputs
 
 if __name__ == "__main__":
@@ -663,7 +344,7 @@ if __name__ == "__main__":
     ap.add_argument("--sample_fraction", type=float, default=0.10)
     args = ap.parse_args()
     modes = [m.strip() for m in args.modes.split(",") if m.strip()]
-    run_specialization_confidence(
+    run_specialization_only(
         modes=modes,
         num_experts=args.num_experts,
         batch_size=args.batch_size,
