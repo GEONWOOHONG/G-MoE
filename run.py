@@ -17,7 +17,6 @@ import argparse
 from train import train_moe
 from utils import set_seed
 from analysis_layers import run_analysis_A
-from analysis_specialization_confidence import run_specialization_confidence
 
 def _setenv_if_missing(k, v):
     if os.environ.get(k) in (None, ""):
