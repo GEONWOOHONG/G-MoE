@@ -232,7 +232,7 @@ if __name__ == "__main__":
 #python run.py eval --batch_size 64 --num_experts 16 --ffn_dim 731
 
 # Full analysis (all modes, all metrics):
-#python run.py analysis --modes switch,gshard,hash,ours_refine --batch_size 44 --num_experts 16
+#python run.py analysis --batch_size 64 --num_experts 16
 
 # Quick debug run (0.1% data, 2 batches):
 #python run.py analysis --modes ours_refine --debug

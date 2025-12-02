@@ -140,25 +140,35 @@ def _register_hooks(model: nn.Module, rec: _Recorder):
             handles.append(module.register_forward_hook(fwd_hook))
     return handles
 
-# -------------------------------------------------------------------------
-# [수정] save_raw_paths: 메타데이터(Source ID, Token ID)도 함께 저장
-# -------------------------------------------------------------------------
 @torch.no_grad()
 def save_raw_paths(rec: _Recorder, mode: str, idx_to_source: Dict[int, str]) -> str:
     print("💾 Saving RAW Trajectory Paths with Metadata...")
+    # 전체 레이어 목록
     layers = sorted(set(rec.layers))
     if not layers: return ""
     
-    # 1. Expert Indices 병합
+    # 1. Expert Indices 병합 (데이터가 있는 레이어만 수집)
     layer_tensors = {}
     sizes = []
+    
+    # has_expert_data: 실제로 전문가 라우팅 데이터가 하나라도 있는지 체크
+    has_expert_data = False 
+    
     for l in layers:
         indices_list = rec.expert_indices[l]
-        if not indices_list: continue
+        if not indices_list:
+            # Switch 모드 등의 홀수 레이어(Dense)는 여기서 스킵됨
+            continue
         t = torch.cat(indices_list, dim=0)
         layer_tensors[l] = t
         sizes.append(t.size(0))
+        has_expert_data = True
     
+    # [FIX 1] Dense 모드처럼 전문가 데이터가 아예 없으면 저장하지 않고 종료
+    if not has_expert_data:
+        print(f"⚠️ No expert routing data collected (Mode: {mode}). Skipping trajectory save.")
+        return ""
+
     # 2. 메타데이터 병합
     if not rec.batch_token_ids:
         print("⚠️ No metadata collected.")
@@ -166,29 +176,34 @@ def save_raw_paths(rec: _Recorder, mode: str, idx_to_source: Dict[int, str]) -> 
     all_tokens = torch.cat(rec.batch_token_ids, dim=0)
     all_srcs = torch.cat(rec.batch_src_ids, dim=0)
     
-    # 3. 길이 동기화 (가장 짧은 길이에 맞춤)
+    # 3. 길이 동기화
     min_len = min(sizes + [all_tokens.size(0), all_srcs.size(0)])
-    print(f"🔹 Aligning tokens across {len(layers)} layers & metadata. Count: {min_len:,}")
+    print(f"🔹 Aligning tokens across {len(layer_tensors)} active layers & metadata. Count: {min_len:,}")
 
     aligned_paths = []
-    for l in layers:
+    
+    # [FIX 2] rec.layers(전체)가 아니라, layer_tensors(데이터가 있는 것)의 키만 사용
+    active_layers = sorted(layer_tensors.keys())
+    
+    for l in active_layers:
+        # 이제 KeyError가 발생하지 않음 (active_layers에 있는 키만 접근하므로)
         t = layer_tensors[l][:min_len].unsqueeze(1)
         aligned_paths.append(t)
     
-    raw_paths = torch.cat(aligned_paths, dim=1).to(torch.int16) # [N, Layers]
-    saved_tokens = all_tokens[:min_len].to(torch.int32)         # [N]
-    saved_srcs = all_srcs[:min_len].to(torch.int16)             # [N]
+    raw_paths = torch.cat(aligned_paths, dim=1).to(torch.int16) # [N, Active_Layers]
+    saved_tokens = all_tokens[:min_len].to(torch.int32)
+    saved_srcs = all_srcs[:min_len].to(torch.int16)
     
     # 4. 저장
     filename = f"raw_trajectory_{mode}.pt"
     save_path = os.path.join(CHECKPOINTS_DIR, filename)
     
     torch.save({
-        "paths": raw_paths,      # Tensor [N, L] (Expert IDs)
-        "tokens": saved_tokens,  # Tensor [N] (Token IDs - 단어 확인용)
-        "sources": saved_srcs,   # Tensor [N] (Source IDs - 출처 확인용)
-        "source_map": idx_to_source, # Dict[int, str] (ID -> 이름 매핑)
-        "layers": layers,
+        "paths": raw_paths,
+        "tokens": saved_tokens,
+        "sources": saved_srcs,
+        "source_map": idx_to_source,
+        "layers": active_layers,
         "mode": mode
     }, save_path)
     
