@@ -195,19 +195,30 @@ def save_raw_paths(rec: _Recorder, mode: str, idx_to_source: Dict[int, str]) -> 
     print(f"✅ Saved raw paths & metadata to: {save_path}")
     return save_path
 
-# compute_same_token_intra_expert_cka, compute_A_metrics 등 기존 분석 함수 유지
+# compute_A_metrics 등 기존 분석 함수 유지
 @torch.no_grad()
-def compute_same_token_intra_expert_cka(model: nn.Module, rec: _Recorder, device: torch.device) -> Dict[int, float]:
-    out = {}
-    print("Computing Intra-Expert CKA (Same Token Similarity)...")
+def compute_detailed_intra_expert_cka(model: nn.Module, rec: _Recorder, device: torch.device) -> Dict[str, Dict[int, float]]:
+    """
+    CKA를 두 가지 관점에서 측정합니다:
+    1. Global_Inter: Global Experts 끼리의 유사도 평균 (Redundancy 체크)
+    2. Local_Global: Local Expert와 Global Experts 간의 유사도 평균 (Role Separation 체크)
+    """
+    out_global_inter = {}
+    out_local_global = {}
+    
+    print("Computing Detailed Intra-Expert CKA (Global-Inter vs Local-Global)...")
+    
     layers = sorted(list(set(rec.layers)))
     for l in layers:
         inputs_list = rec.pre_mlp[l]
         if not inputs_list: continue
+        
+        # 입력 데이터 준비 (최대 2048개 샘플링)
         X_cpu = torch.cat(inputs_list, dim=0)
         if X_cpu.size(0) > 2048: X_cpu = X_cpu[:2048]
         X = X_cpu.to(device)
         
+        # 모델 모듈 가져오기
         if l >= len(model.transformer.h): continue
         block = model.transformer.h[l]
         if not hasattr(block, "mlp"): continue
@@ -216,30 +227,56 @@ def compute_same_token_intra_expert_cka(model: nn.Module, rec: _Recorder, device
         if isinstance(mlp, MoELayer): moe = mlp
         if moe is None: continue
             
-        experts_to_compare = []
-        if hasattr(moe, "experts") and moe.experts is not None:
-            experts_to_compare.extend([e for e in moe.experts])
+        # --- [1] Global Experts 출력 계산 ---
+        global_experts_list = []
         if hasattr(moe, "global_experts") and moe.global_experts is not None:
-            experts_to_compare.extend([e for e in moe.global_experts])
-             
-        num_experts = len(experts_to_compare)
-        if num_experts < 2:
-            out[l] = float("nan")
-            continue
-            
-        expert_outputs = []
-        for exp in experts_to_compare:
-            y = exp(X)
-            expert_outputs.append(y)
-        
-        cka_vals = []
-        for i in range(num_experts):
-            for j in range(i + 1, num_experts):
-                val = _cka_linear(expert_outputs[i], expert_outputs[j]).item()
-                cka_vals.append(val)
-        if cka_vals: out[l] = float(np.mean(cka_vals))
-        else: out[l] = 0.0
-    return out
+            global_experts_list = [e for e in moe.global_experts]
+        elif hasattr(moe, "experts") and moe.experts is not None:
+            # ours_refine이 아닌 일반 MoE(Switch 등)의 경우 모든 expert를 global로 취급
+            # 단, ours_refine/ours_com 모드라면 moe.experts는 Local용이므로 여기 포함 안 됨
+            if moe.mode not in ["ours_refine", "ours_com"]:
+                global_experts_list = [e for e in moe.experts]
+
+        global_outputs = []
+        if global_experts_list:
+            for exp in global_experts_list:
+                global_outputs.append(exp(X))
+
+        # --- [2] Global-Inter CKA 계산 ---
+        # Global Expert가 2개 이상일 때만 상호 유사도 측정 가능
+        num_globals = len(global_outputs)
+        if num_globals >= 2:
+            cka_vals = []
+            for i in range(num_globals):
+                for j in range(i + 1, num_globals):
+                    val = _cka_linear(global_outputs[i], global_outputs[j]).item()
+                    cka_vals.append(val)
+            out_global_inter[l] = float(np.mean(cka_vals))
+        else:
+            out_global_inter[l] = float("nan")
+
+        # --- [3] Local-Global CKA 계산 ---
+        # ours_refine/ours_com 구조에서만 유효 (Local Expert가 별도로 존재)
+        local_output = None
+        if hasattr(moe, "experts") and len(moe.experts) > 0 and moe.mode in ["ours_refine", "ours_com"]:
+            # Local Expert는 보통 experts 리스트의 첫 번째 혹은 유일한 원소
+            local_expert = moe.experts[0]
+            local_output = local_expert(X)
+
+        if local_output is not None and num_globals > 0:
+            lg_cka_vals = []
+            for g_out in global_outputs:
+                val = _cka_linear(local_output, g_out).item()
+                lg_cka_vals.append(val)
+            out_local_global[l] = float(np.mean(lg_cka_vals))
+        else:
+            # Local Expert가 없거나 Global이 없는 경우 측정 불가
+            out_local_global[l] = float("nan")
+
+    return {
+        "Global_Inter_CKA": out_global_inter,
+        "Local_Global_CKA": out_local_global
+    }
 
 @torch.no_grad()
 def compute_A_metrics(rec: _Recorder) -> Dict:
@@ -372,8 +409,14 @@ def run_analysis_A(mode: str = "ours_refine",
     # [수정] 메타데이터 맵도 함께 전달
     raw_path_file = save_raw_paths(rec, mode, idx_to_source)
     
+    # [수정됨] 상세 CKA 계산 호출
+    detailed_cka = compute_detailed_intra_expert_cka(model, rec, device)
+    
     resA = compute_A_metrics(rec)
-    resA["IntraExpertCKA"] = compute_same_token_intra_expert_cka(model, rec, device)
+    
+    # 결과를 resA 딕셔너리에 병합
+    resA["GlobalInterCKA"] = detailed_cka["Global_Inter_CKA"]
+    resA["LocalGlobalCKA"] = detailed_cka["Local_Global_CKA"]
     
     result = {
         "mode": mode,
