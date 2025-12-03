@@ -1267,7 +1267,8 @@ class HashRouter:
             table_path = freq_dict['__load_from_file__']
             import os, torch
             if os.path.exists(table_path):
-                print(f"🔹 Loading HashRouter table directly from {table_path}")
+                if _rank0():
+                    print(f"🔹 Loading HashRouter table directly from {table_path}")
                 obj = torch.load(table_path, map_location='cpu')
                 self.table_tensor = obj.to(torch.long)
                 self.table = self.table_tensor.tolist()
@@ -1277,7 +1278,8 @@ class HashRouter:
         if not table_loaded_from_file:
             import torch
             if saved_table_path and os.path.exists(saved_table_path):
-                print(f"🔹 Loading HashRouter table from {saved_table_path}")
+                if _rank0():
+                    print(f"🔹 Loading HashRouter table from {saved_table_path}")
                 obj = torch.load(saved_table_path, map_location='cpu')
                 self.table_tensor = obj.to(torch.long)
                 self.table = self.table_tensor.tolist()
