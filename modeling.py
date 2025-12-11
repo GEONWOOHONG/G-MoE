@@ -400,63 +400,41 @@ class MoELayer(nn.Module):
                 self.proj_gamma_beta = nn.Linear(self.cond_dim, d_model, bias=False)
 
         elif mode == "ours_refine":
-            if self.ablate_global_router:
-                # Global Router Ablation: 일반 Router 사용
-                if self.ablate_global:
-                    # Global Ablation 시: 기존 로직대로 전문가 리스트만 생성
-                    if num_experts < 2:
-                        raise ValueError("ours_refine with ablate_global requires at least 1 local + 1 routed expert.")
-                    self.num_experts = num_experts - 1
-                    self.experts = nn.ModuleList(
-                        [Expert(d_model, d_ff) for _ in range(num_experts)]
-                    )
-                    self.global_experts = None
-                else:
-                    self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(1)])  # Local
-                    if global_experts is None:
-                        raise ValueError("ours_refine requires global_experts when ablate_global=False")
-                    self.global_experts = global_experts  # Global Experts
-                    self.num_experts = len(global_experts)
-                    # GRU 대신 일반 Router 초기화 (Global Expert 선택용)
-                    self.router = Router(d_model, self.num_experts, top_k=1, alpha=alpha)
+            if self.ablate_global:
+                if num_experts < 2:
+                    raise ValueError("ours_refine with ablate_global requires at least 1 local + 1 routed expert.")
+                self.num_experts = num_experts - 1
+                self.experts = nn.ModuleList(
+                    [Expert(d_model, d_ff) for _ in range(num_experts)]
+                )
+                self.global_experts = None
             else:
-                # 기존 로직: GRU 기반 라우터 설정
-                if self.ablate_global:
-                    if num_experts < 2:
-                        raise ValueError("ours_refine with ablate_global requires at least 1 local + 1 routed expert.")
-                    self.num_experts = num_experts - 1
-                    self.experts = nn.ModuleList(
-                        [Expert(d_model, d_ff) for _ in range(num_experts)]
-                    )
-                    self.global_experts = None
-                else:
-                    self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(1)])
-                    if global_experts is None:
-                        raise ValueError("ours_refine requires global_experts when ablate_global=False")
-                    self.num_experts = len(global_experts)
-                    self.global_experts = global_experts
+                self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(1)])
+                if global_experts is None:
+                    raise ValueError("ours_refine requires global_experts when ablate_global=False")
+                self.num_experts = len(global_experts)
+                self.global_experts = global_experts
 
+            if self.ablate_global_router:
+                self.shared_router = None
+                self.cond_dim = d_model
+            else:
                 assert shared_router is not None, "ours_refine requires a shared_router"
                 self.shared_router = shared_router
-                self.h_ln = nn.LayerNorm(self.shared_router.gru.hidden_size)
-                
                 self.cond_dim = self.shared_router.gru.hidden_size
-                self.score_dim = self.num_experts
-                
-                # Logit Propagation Ablation 체크
-                if self.ablate_logit_prog:
-                    # 로짓 프로파게이션 제거: 입력 차원이 cond_dim (GRU hidden) 만 사용
-                    self.gate_head = nn.Linear(self.cond_dim, self.score_dim, bias=False)
-                    # prev_score 관련 모듈 제거 (None 처리)
-                    self.prev_score_ln = None
-                    self.prev_score_proj = None
-                else:
-                    # 기존 로직: cond_dim + cond_dim (GRU + Logit Prop)
-                    self.prev_score_ln = nn.LayerNorm(self.score_dim)
-                    self.prev_score_proj = nn.Linear(self.score_dim, self.cond_dim, bias=False)
-                    self.gate_head = nn.Linear(self.cond_dim + self.cond_dim, self.score_dim, bias=False)
-                
-                self.last_scores = None
+
+            self.h_ln = nn.LayerNorm(self.cond_dim)
+            self.score_dim = self.num_experts
+            self.last_scores = None
+
+            if self.ablate_logit_prog:
+                self.gate_head = nn.Linear(self.cond_dim, self.score_dim, bias=False)
+                self.prev_score_ln = None
+                self.prev_score_proj = None
+            else:
+                self.prev_score_ln = nn.LayerNorm(self.score_dim)
+                self.prev_score_proj = nn.Linear(self.score_dim, self.cond_dim, bias=False)
+                self.gate_head = nn.Linear(self.cond_dim + self.cond_dim, self.score_dim, bias=False)
 
         elif mode == "hash":
             self.experts = nn.ModuleList([Expert(d_model, d_ff) for _ in range(num_experts)])
@@ -727,69 +705,37 @@ class MoELayer(nn.Module):
             return routed_out, aux_loss, h_new
 
         elif self.mode == "ours_refine":
-            # CASE 1: Global Router Ablation (GRU 제거, 일반 라우터 사용)
             if self.ablate_global_router:
-                # 1. Local Expert 실행 (무조건 실행)
-                local_out = self.experts[0](x)
-                
-                # 2. Global Experts 실행 (일반 Router 사용)
-                top_scores, top_idx, balance_loss = self.router(x)
-                
-                bsz, seq, h = x.shape
-                x_flat = x.view(-1, h)
-                out_flat = torch.zeros_like(x_flat)
-                
-                # Global Expert Routing Logic (Switch style)
-                capacity = int(self.capacity_factor * math.ceil(x_flat.size(0) / self.num_experts))
-                top_idx_flat = top_idx.view(-1)
-                top_scores_flat = top_scores.view(-1, 1)
-
-                for eid in range(self.num_experts):
-                    idx = (top_idx_flat == eid).nonzero(as_tuple=True)[0]
-                    if idx.numel() > 0:
-                        expert_out = self.global_experts[eid](x_flat[idx]) * top_scores_flat[idx]
-                        out_flat[idx] = expert_out.to(out_flat.dtype)
-                
-                global_out = out_flat.view(bsz, seq, h)
-                
-                # 3. 합산
-                routed_out = local_out + global_out
-                
-                # GRU 상태 업데이트 없음, 로짓 프로파게이션 없음
-                return routed_out, balance_loss, routing_state
-
-            # CASE 2: 기존 GRU 기반 로직 (Logit Prop Ablation 포함)
-            if isinstance(routing_state, dict) and ("h" in routing_state) and (routing_state["h"] is not None):
-                h_prev = routing_state["h"]
-            else:
+                h_new = x
                 h_prev = None
-
-            h_new = self.shared_router(x, h_prev=h_prev)
+            else:
+                if isinstance(routing_state, dict) and ("h" in routing_state) and (routing_state["h"] is not None):
+                    h_prev = routing_state["h"]
+                else:
+                    h_prev = None
+                h_new = self.shared_router(x, h_prev=h_prev)
+            
             h_norm = self.h_ln(h_new)
             h_feat = h_norm.view(-1, h_norm.size(-1))
+            N = h_feat.size(0)
+
+            if self.ablate_logit_prog:
+                gate_in = h_feat
+                logits = self.gate_head(gate_in)
+            else:
+                if isinstance(routing_state, dict) and ("logits" in routing_state) and (routing_state["logits"] is not None):
+                    prev_logits = routing_state["logits"].to(h_feat.dtype)
+                else:
+                    prev_logits = h_feat.new_zeros((N, self.score_dim))
+                
+                prev_feat = self.prev_score_proj(self.prev_score_ln(prev_logits))
+                gate_in = torch.cat([h_feat, prev_feat], dim=-1)
+                logits = self.gate_head(gate_in)
+            
+            scores = F.softmax(logits, dim=-1)
+            self.last_scores = scores.detach()
 
             if getattr(self, "ablate_local", False):
-                N = h_feat.size(0)
-                
-                # Ablation Logic 적용
-                if self.ablate_logit_prog:
-                    # Logit Propagation 제거: GRU feature만 사용
-                    gate_in = h_feat
-                    logits = self.gate_head(gate_in)
-                else:
-                    # 기존 로직: Logit Propagation 사용
-                    prev_logits = (
-                        routing_state.get("logits").to(h_feat.dtype)
-                        if isinstance(routing_state, dict)
-                        and routing_state.get("logits") is not None
-                        else h_feat.new_zeros((N, self.score_dim))
-                    )
-                    prev_feat = self.prev_score_proj(self.prev_score_ln(prev_logits))
-                    gate_in = torch.cat([h_feat, prev_feat], dim=-1)
-                    logits = self.gate_head(gate_in)
-                scores = F.softmax(logits, dim=-1)
-                self.last_scores = scores.detach()
-
                 B, T, H = x.shape
                 x_flat = x.view(-1, H)
                 topk = min(2, self.num_experts)
@@ -846,29 +792,14 @@ class MoELayer(nn.Module):
                 if probe is not None:
                     aux_loss = (aux_loss if aux_loss is not None else 0.0) + probe
 
-                updated_routing_state = {"h": h_new, "logits": logits.detach()}
+                updated_routing_state = {
+                    "h": h_new if not self.ablate_global_router else None, 
+                    "logits": logits.detach()
+                }
 
                 return routed_out, aux_loss, updated_routing_state
 
             elif getattr(self, "ablate_global", False):
-                N = h_feat.size(0)
-
-                if self.ablate_logit_prog:
-                    gate_in = h_feat
-                    logits = self.gate_head(gate_in)
-                else:
-                    prev_logits = (
-                        routing_state.get("logits").to(h_feat.dtype)
-                        if isinstance(routing_state, dict)
-                        and routing_state.get("logits") is not None
-                        else h_feat.new_zeros((N, self.score_dim))
-                    )
-                    prev_feat = self.prev_score_proj(self.prev_score_ln(prev_logits))
-                    gate_in = torch.cat([h_feat, prev_feat], dim=-1)
-                    logits = self.gate_head(gate_in)
-                scores = F.softmax(logits, dim=-1)
-                self.last_scores = scores.detach()
-
                 B, T, H = x.shape
                 local_out = self.experts[0](x)
 
@@ -899,32 +830,17 @@ class MoELayer(nn.Module):
                     fi = freq * self.num_experts
                     aux_loss = (Pi * fi).sum() * self.aux_alpha
 
-                updated_routing_state = {"h": h_new, "logits": logits.detach()}
-
                 alpha = getattr(self, "ddp_probe_alpha", 1e-8)
                 probe = self._ddp_probe_loss(dtype=x.dtype, device=x.device, alpha=alpha)
                 if probe is not None:
                     aux_loss = (aux_loss if aux_loss is not None else 0.0) + probe
 
+                updated_routing_state = {
+                    "h": h_new if not self.ablate_global_router else None,
+                    "logits": logits.detach()
+                }
+
                 return routed_out, aux_loss, updated_routing_state
-
-            N = h_feat.size(0)
-            
-            if self.ablate_logit_prog:
-                gate_in = h_feat
-                logits = self.gate_head(gate_in)
-            else:
-                if isinstance(routing_state, dict) and ("logits" in routing_state) and (routing_state["logits"] is not None):
-                    prev_logits = routing_state["logits"]
-                    prev_logits = prev_logits.to(h_feat.dtype)
-                else:
-                    prev_logits = h_feat.new_zeros((N, self.score_dim))
-
-                prev_feat = self.prev_score_proj(self.prev_score_ln(prev_logits))
-                gate_in = torch.cat([h_feat, prev_feat], dim=-1)
-                logits = self.gate_head(gate_in)
-            scores = F.softmax(logits, dim=-1)
-            self.last_scores = scores.detach()
 
             B, T, H = x.shape
             local_out = self.experts[0](x)
@@ -965,7 +881,10 @@ class MoELayer(nn.Module):
             if probe is not None:
                 aux_loss = (aux_loss if aux_loss is not None else 0.0) + probe
 
-            updated_routing_state = {"h": h_new, "logits": logits.detach()}
+            updated_routing_state = {
+                "h": h_new if not self.ablate_global_router else None,
+                "logits": logits.detach()
+            }
             return routed_out, aux_loss, updated_routing_state
 
         elif self.mode == "hash":

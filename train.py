@@ -250,7 +250,9 @@ def train_moe(
         trainer_path = os.path.join(save_dir, "best_checkpoint_trainer.pt")
         if not (os.path.exists(best_ckpt) and os.path.exists(trainer_path)):
             raise FileNotFoundError("Checkpoint files not found for continuation.")
-        load_model(model, best_ckpt)
+        from utils import load_safetensors 
+        load_safetensors(model, best_ckpt, mode=mode, strict=False) 
+        
         print(f"🔹 Loaded model weights from: {best_ckpt}")
         trainer_state = torch.load(trainer_path, map_location="cpu")
         print(f"🔹 Restoring optimizer/scheduler from {trainer_path}")
